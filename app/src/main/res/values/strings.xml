@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Just Web Cam</string>
+    <string name="http_address_label">http://%1$s:8080/</string>
+</resources>
