@@ -12,7 +12,7 @@
         android:text="Camera Stream Control"
         android:textSize="20sp" />
 
-    <androidx.appcompat.widget.AppCompatToggleButton
+    <ToggleButton
         android:id="@+id/streamSwitchButton"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"

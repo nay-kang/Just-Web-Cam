@@ -13,8 +13,8 @@ import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.appcompat.widget.AppCompatToggleButton
 import androidx.core.content.ContextCompat
+import android.widget.ToggleButton
 import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.util.Collections
@@ -23,7 +23,7 @@ class MainActivity : ComponentActivity() {
 
     private lateinit var multiplePermissionsResultLauncher: ActivityResultLauncher<Array<String>>
     private var isStreaming = false // Track streaming state
-    private lateinit var streamSwitchButton: AppCompatToggleButton // Switch button
+    private lateinit var streamSwitchButton: ToggleButton // Switch button
     private lateinit var ipAddressTextView: TextView // TextView for IP address
 
     override fun onCreate(savedInstanceState: Bundle?) {
