@@ -75,7 +75,7 @@ class CameraStreamService : Service() {
         const val VERY_LONG_EXPOSURE_TIME_NS = 200_000_000L // 200ms (adjust as needed)
 
         // FPS ranges
-        val DEFAULT_FPS_RANGE = Range(10,15)// Default FPS range
+        val DEFAULT_FPS_RANGE = Range(10, 15)// Default FPS range
         val VERY_LOW_FPS_RANGE = Range(5, 5) // Very low FPS range for very long
     }
 
@@ -250,32 +250,13 @@ class CameraStreamService : Service() {
     }
 
     private fun processAndQueueFrame(image: Image) {
-
-        var timestamp = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date())
-        timestamp += " ${getBatteryPercentage()}%\uD83D\uDD0B"
-        val bitmap = imageToBitmap(image) ?: return
-        image.close()
-
-        // Create a mutable bitmap to draw on
-        val mutableBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, true)
-        bitmap.recycle()
-
         frameCounter++
         if (frameCounter % 15 == 0) { // Calculate brightness every 15 frames
             frameCounter = 0
-            // Create a smaller bitmap for brightness calculation
-            val scaleFactor = 4 // Reduce to 1/4th size
-            val smallBitmap = Bitmap.createScaledBitmap(
-                mutableBitmap,
-                mutableBitmap.width / scaleFactor,
-                mutableBitmap.height / scaleFactor,
-                false
-            )
 
             // Calculate average brightness on the smaller bitmap
-            val averageBrightness = calculateAverageBrightnessOptimized(smallBitmap)
+            val averageBrightness = calculateAverageBrightnessOptimized(image)
             Log.d(TAG, "Average Brightness: $averageBrightness")
-            smallBitmap.recycle() // Recycle the smaller bitmap
 
             // Determine light level category
             val currentLightLevel = when {
@@ -291,6 +272,15 @@ class CameraStreamService : Service() {
                 adjustExposure(currentLightLevel)
             }
         }
+
+        var timestamp = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date())
+        timestamp += " ${getBatteryPercentage()}%\uD83D\uDD0B"
+        val bitmap = imageToBitmap(image) ?: return
+        image.close()
+
+        // Create a mutable bitmap to draw on
+        val mutableBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, true)
+        bitmap.recycle()
 
         val canvas = Canvas(mutableBitmap)
         val textPaint = Paint().apply {
@@ -330,20 +320,28 @@ class CameraStreamService : Service() {
         frameQueue.offer(modifiedJpegBytes)
     }
 
-    private fun calculateAverageBrightnessOptimized(bitmap: Bitmap): Int {
-        val width = bitmap.width
-        val height = bitmap.height
-        var totalBrightness = 0L
-        val pixels = IntArray(width * height)
-        bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
+    private fun calculateAverageBrightnessOptimized(image: Image): Int {
+        val yPlane = image.planes[0]
+        val yBuffer = yPlane.buffer
+        val rowStride = yPlane.rowStride
+        val pixelStride = yPlane.pixelStride
+        val width = image.width
+        val height = image.height
 
-        for (pixel in pixels) {
-            // Extract the red component
-            val r = Color.red(pixel)
-            totalBrightness += r
+        var totalBrightness = 0L
+        var sampleCount = 0
+        val sampleStep = 8 // Sample every 8th pixel in both dimensions
+
+        for (y in 0 until height step sampleStep) {
+            for (x in 0 until width step sampleStep) {
+                val pixelIndex = y * rowStride + x * pixelStride
+                val yValue = yBuffer.get(pixelIndex).toInt() and 0xFF // Ensure value is unsigned
+                totalBrightness += yValue
+                sampleCount++
+            }
         }
 
-        return (totalBrightness / (width * height)).toInt()
+        return if (sampleCount > 0) (totalBrightness / sampleCount).toInt() else 0
     }
 
     private fun adjustExposure(lightLevel: LightLevel) {
@@ -444,27 +442,23 @@ class CameraStreamService : Service() {
             image.height,
             null
         )
-        val out = ByteArrayOutputStream()
-        yuvImage.compressToJpeg(
-            android.graphics.Rect(0, 0, image.width, image.height),
-            90,
-            out
-        )
-        val imageBytes = out.toByteArray()
-        out.closeSafely()
 
-        // Decode the JPEG bytes into a Bitmap
-        val decodedBitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
-        if (decodedBitmap == null) {
-            Log.e(TAG, "Failed to decode image bytes into Bitmap")
-            return null
+        ByteArrayOutputStream().use { out -> // Use 'use' to auto-close ByteArrayOutputStream
+            yuvImage.compressToJpeg(
+                android.graphics.Rect(0, 0, image.width, image.height),
+                90,
+                out
+            )
+            val imageBytes = out.toByteArray()
+
+            val decodedBitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+            return decodedBitmap?.copy(Bitmap.Config.ARGB_8888, true)?.apply {
+                decodedBitmap.recycle() // Recycle original decodedBitmap
+            } ?: run {
+                Log.e(TAG, "Failed to decode image bytes into Bitmap")
+                null
+            }
         }
-
-        // Create a mutable copy of the Bitmap
-        val mutableBitmap = decodedBitmap.copy(Bitmap.Config.ARGB_8888, true)
-        decodedBitmap.recycle() // Recycle the immutable Bitmap
-
-        return mutableBitmap
     }
 
     private val cameraStateCallback = object : CameraDevice.StateCallback() {
@@ -482,7 +476,15 @@ class CameraStreamService : Service() {
         override fun onError(camera: CameraDevice, error: Int) {
             camera.close()
             cameraDevice = null
-            Log.e(TAG, "Camera error: $error")
+            val errorDescription = when (error) {
+                ERROR_CAMERA_DEVICE -> "Device-level error"
+                ERROR_CAMERA_DISABLED -> "Camera disabled by policy"
+                ERROR_CAMERA_IN_USE -> "Camera in use"
+                ERROR_CAMERA_SERVICE -> "Camera service error"
+                ERROR_MAX_CAMERAS_IN_USE -> "Max cameras in use"
+                else -> "Unknown error code: $error"
+            }
+            Log.e(TAG, "Camera error: $error, Description: $errorDescription")
         }
     }
 
@@ -526,9 +528,9 @@ class CameraStreamService : Service() {
                         session.device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
                             addTarget(surface)
                             set(
-                                    CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
-                                    DEFAULT_FPS_RANGE
-                                )
+                                CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                                DEFAULT_FPS_RANGE
+                            )
                         }
                     session.setRepeatingRequest(
                         requestBuilder.build(),
