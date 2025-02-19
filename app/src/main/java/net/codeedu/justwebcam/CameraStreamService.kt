@@ -14,10 +14,6 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.ImageFormat
 import android.graphics.Paint
-import android.hardware.Sensor
-import android.hardware.SensorEvent
-import android.hardware.SensorEventListener
-import android.hardware.SensorManager
 import android.hardware.camera2.CameraAccessException
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
@@ -33,6 +29,7 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
 import android.util.Log
+import android.util.Range
 import android.util.Size
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
@@ -44,9 +41,7 @@ import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
 
-class CameraStreamService : Service(),SensorEventListener {
-    private val LIGHT_CHANGE_THRESHOLD: Float = 5f
-    private var currentLightLevel: Float = -1000f
+class CameraStreamService : Service() {
     private lateinit var cameraId: String
     private lateinit var cameraManager: CameraManager
     private var cameraDevice: CameraDevice? = null
@@ -56,10 +51,14 @@ class CameraStreamService : Service(),SensorEventListener {
     private val cameraThread = HandlerThread("CameraThread").apply { start() }
     private val frameQueue = LinkedBlockingQueue<ByteArray>(1)
     private lateinit var streamServer: StreamServer
-    private lateinit var sensorManager: SensorManager
-    private var lightSensor: Sensor? = null
     private val imageProcessingThread = HandlerThread("ImageProcessing").apply { start() }
     private val imageProcessingHandler = Handler(imageProcessingThread.looper)
+    private var frameCounter = 0
+    private var lastLightLevel = LightLevel.NORMAL // Initialize with bright light
+
+    private enum class LightLevel {
+        NORMAL, DEEP_DARK, KEEP
+    }
 
     companion object {
         internal const val TAG = "CameraStreamService"
@@ -67,6 +66,17 @@ class CameraStreamService : Service(),SensorEventListener {
         const val ACTION_START_STREAM =
             "net.codeedu.justwebcam.ACTION_START_STREAM" // Actions for starting/stopping
         const val ACTION_STOP_STREAM = "net.codeedu.justwebcam.ACTION_STOP_STREAM"
+
+        // Brightness thresholds (adjust these based on your testing)
+        const val NORMAL_LIGHT_THRESHOLD = 180 // Bright light if average brightness > 180
+        const val DEEP_DARK_LIGHT_THRESHOLD = 30 // Deep dark light if average brightness < 30
+
+        // Exposure time values (in nanoseconds)
+        const val VERY_LONG_EXPOSURE_TIME_NS = 200_000_000L // 200ms (adjust as needed)
+
+        // FPS ranges
+        val DEFAULT_FPS_RANGE = Range(10,15)// Default FPS range
+        val VERY_LOW_FPS_RANGE = Range(5, 5) // Very low FPS range for very long
     }
 
     override fun onCreate() {
@@ -81,9 +91,6 @@ class CameraStreamService : Service(),SensorEventListener {
             8080
         )
 
-        sensorManager = getSystemService(SENSOR_SERVICE) as SensorManager
-        lightSensor = sensorManager.getDefaultSensor(Sensor.TYPE_LIGHT)
-
         Log.d(TAG, "Service onCreate")
     }
 
@@ -92,13 +99,11 @@ class CameraStreamService : Service(),SensorEventListener {
         when (intent?.action) {
             ACTION_START_STREAM -> {
                 startForegroundService() // Start as foreground service
-                sensorManager.registerListener(this,  lightSensor, SensorManager.SENSOR_DELAY_NORMAL)
                 streamServer.start()
             }
 
             ACTION_STOP_STREAM -> {
                 stopCameraStreaming()
-                sensorManager.unregisterListener(this)
                 stopForegroundService() // Stop foreground service and service itself
                 stopSelf() // Stop the service
             }
@@ -106,64 +111,6 @@ class CameraStreamService : Service(),SensorEventListener {
             else -> Log.w(TAG, "Unknown action: ${intent?.action}")
         }
         return START_STICKY // Or START_NOT_STICKY, depending on your needs
-    }
-
-    override fun onSensorChanged(event: SensorEvent?) {
-        event?.let {
-            if (it.sensor.type  == Sensor.TYPE_LIGHT) {
-                Log.d(TAG,"Light sensor changed: ${it.values[0]}")
-                val newLightLevel = it.values[0]
-                if (kotlin.math.abs(newLightLevel  - currentLightLevel) > LIGHT_CHANGE_THRESHOLD) {
-                    currentLightLevel = newLightLevel
-                    adjustExposureCompensation(newLightLevel)
-                }
-            }
-        }
-    }
-
-    private fun adjustExposureCompensation(lightLevel: Float) {
-        if(!this::cameraManager.isInitialized){
-            return
-        }
-        val cameraCharacteristics = cameraManager.getCameraCharacteristics(cameraId)
-        val maxExposureCompensation = cameraCharacteristics.get(
-            CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE
-        )?.upper?: 0
-        Log.d(TAG,"maxExposureCompensation: $maxExposureCompensation")
-        val targetExposureCompensation: Int = when {
-            lightLevel > 500f -> {
-                // Bright light, set exposure compensation to 0
-                0
-            }
-
-            lightLevel < 10f -> {
-                // Dark night, set exposure compensation to the maximum of 4 or the max available
-                minOf(maxExposureCompensation, 4)
-            }
-
-            else -> {
-                // Intermediate light, adjust the value as needed
-                ((500-lightLevel)/160).toInt()
-            }
-        }
-
-        // Update the exposure compensation in the capture request
-        captureSession?.let { session ->
-            try {
-                val requestBuilder = session.device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply  {
-                    addTarget(imageReader!!.surface)
-                    set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, targetExposureCompensation)
-                    Log.i(TAG,"Setting CONTROL_AE_EXPOSURE_COMPENSATION to: $targetExposureCompensation")
-                }
-                session.setRepeatingRequest(requestBuilder.build(),  null, cameraHandler)
-            } catch (e: CameraAccessException) {
-                Log.e(TAG, "Repeating capture request exception", e)
-            }
-        }
-    }
-
-    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {
-        //TODO("Not yet implemented")
     }
 
     private fun startForegroundService() {
@@ -283,8 +230,6 @@ class CameraStreamService : Service(),SensorEventListener {
                         Log.e(TAG, "ImageReader buffer full", e)
                     }
                 }, cameraHandler)
-
-
             }
 
             cameraManager.openCamera(cameraId, cameraStateCallback, cameraHandler)
@@ -315,6 +260,38 @@ class CameraStreamService : Service(),SensorEventListener {
         val mutableBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, true)
         bitmap.recycle()
 
+        frameCounter++
+        if (frameCounter % 15 == 0) { // Calculate brightness every 15 frames
+            frameCounter = 0
+            // Create a smaller bitmap for brightness calculation
+            val scaleFactor = 4 // Reduce to 1/4th size
+            val smallBitmap = Bitmap.createScaledBitmap(
+                mutableBitmap,
+                mutableBitmap.width / scaleFactor,
+                mutableBitmap.height / scaleFactor,
+                false
+            )
+
+            // Calculate average brightness on the smaller bitmap
+            val averageBrightness = calculateAverageBrightnessOptimized(smallBitmap)
+            Log.d(TAG, "Average Brightness: $averageBrightness")
+            smallBitmap.recycle() // Recycle the smaller bitmap
+
+            // Determine light level category
+            val currentLightLevel = when {
+                averageBrightness > NORMAL_LIGHT_THRESHOLD -> LightLevel.NORMAL
+                averageBrightness < DEEP_DARK_LIGHT_THRESHOLD -> LightLevel.DEEP_DARK
+                else -> LightLevel.KEEP
+            }
+
+            // Update exposure if needed
+            if (currentLightLevel != lastLightLevel && currentLightLevel != LightLevel.KEEP) {
+                lastLightLevel = currentLightLevel
+                Log.d(TAG, "Adjusting light level to: $currentLightLevel")
+                adjustExposure(currentLightLevel)
+            }
+        }
+
         val canvas = Canvas(mutableBitmap)
         val textPaint = Paint().apply {
             color = Color.WHITE // Main text color is white
@@ -344,7 +321,6 @@ class CameraStreamService : Service(),SensorEventListener {
         textPaint.textAlign = Paint.Align.LEFT // Ensure same alignment as border
         canvas.drawText(timestamp, x, y, textPaint)
 
-
         val outputStream = ByteArrayOutputStream()
         mutableBitmap.compress(Bitmap.CompressFormat.JPEG, 50, outputStream)
         val modifiedJpegBytes = outputStream.toByteArray()
@@ -352,6 +328,97 @@ class CameraStreamService : Service(),SensorEventListener {
         mutableBitmap.recycle()
 
         frameQueue.offer(modifiedJpegBytes)
+    }
+
+    private fun calculateAverageBrightnessOptimized(bitmap: Bitmap): Int {
+        val width = bitmap.width
+        val height = bitmap.height
+        var totalBrightness = 0L
+        val pixels = IntArray(width * height)
+        bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
+
+        for (pixel in pixels) {
+            // Extract the red component
+            val r = Color.red(pixel)
+            totalBrightness += r
+        }
+
+        return (totalBrightness / (width * height)).toInt()
+    }
+
+    private fun adjustExposure(lightLevel: LightLevel) {
+
+        captureSession?.let { session ->
+            try {
+                val cameraCharacteristics = cameraManager.getCameraCharacteristics(cameraId)
+                val exposureTimeRange =
+                    cameraCharacteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
+                val fpsRanges =
+                    cameraCharacteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+                val isoRange =
+                    cameraCharacteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
+
+                if (exposureTimeRange == null || fpsRanges == null) {
+                    Log.e(TAG, "Exposure time range or FPS ranges not supported")
+                    return
+                }
+                var requestBuilder: CaptureRequest.Builder? = null
+                if (lightLevel == LightLevel.DEEP_DARK) {
+                    val clampedExposureTime = VERY_LONG_EXPOSURE_TIME_NS.coerceIn(
+                        exposureTimeRange.lower.toLong(),
+                        exposureTimeRange.upper.toLong()
+                    )
+                    Log.d(TAG, "Clamped Exposure Time: $clampedExposureTime")
+                    requestBuilder =
+                        cameraDevice?.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+                            ?.apply {
+                                addTarget(imageReader!!.surface)
+                                set(
+                                    CaptureRequest.CONTROL_SCENE_MODE,
+                                    CaptureRequest.CONTROL_SCENE_MODE_NIGHT
+                                )
+                                set(
+                                    CaptureRequest.CONTROL_AE_MODE,
+                                    CaptureRequest.CONTROL_AE_MODE_OFF
+                                ) // Turn off auto-exposure
+                                set(
+                                    CaptureRequest.SENSOR_EXPOSURE_TIME,
+                                    VERY_LONG_EXPOSURE_TIME_NS
+                                ) // Set exposure time
+                                set(
+                                    CaptureRequest.NOISE_REDUCTION_MODE,
+                                    CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY
+                                )
+                                set(
+                                    CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                                    VERY_LOW_FPS_RANGE
+                                ) // Set FPS range
+                                set(CaptureRequest.SENSOR_SENSITIVITY, isoRange?.upper ?: 800)
+
+                            }
+                } else {
+                    requestBuilder =
+                        cameraDevice?.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+                            ?.apply {
+                                addTarget(imageReader!!.surface)
+                                set(
+                                    CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                                    DEFAULT_FPS_RANGE
+                                )
+                            }
+                }
+
+                requestBuilder?.let {
+                    session.setRepeatingRequest(
+                        it.build(),
+                        null,
+                        cameraHandler
+                    )
+                }
+            } catch (e: CameraAccessException) {
+                Log.e(TAG, "Failed to adjust exposure", e)
+            }
+        }
     }
 
     private fun imageToBitmap(image: Image): Bitmap? {
@@ -454,42 +521,14 @@ class CameraStreamService : Service(),SensorEventListener {
         captureSession?.let { session ->
             imageReader?.surface?.let { surface ->
                 try {
-                    val cameraCharacteristics = cameraManager.getCameraCharacteristics(cameraId)
-                    val fpsRanges =
-                        cameraCharacteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
-                    val desiredFpsRange =
-                        fpsRanges?.find { it.upper >= 10 } ?: fpsRanges?.lastOrNull()
-
-                    if (desiredFpsRange != null) {
-                        Log.d(TAG, "Setting FPS range to: $desiredFpsRange")
-                    } else {
-                        Log.w(
-                            TAG,
-                            "Desired FPS range (>= 15) not supported. Using default range."
-                        )
-                    }
-
-
 
                     val requestBuilder =
                         session.device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
                             addTarget(surface)
-                            desiredFpsRange?.let {
-                                set(
+                            set(
                                     CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
-                                    it
+                                    DEFAULT_FPS_RANGE
                                 )
-                            }
-
-                            set(
-                                CaptureRequest.CONTROL_AE_MODE,
-                                CaptureRequest.CONTROL_AE_MODE_ON
-                            )
-
-                            set(
-                                CaptureRequest.NOISE_REDUCTION_MODE,
-                                CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY
-                            )
                         }
                     session.setRepeatingRequest(
                         requestBuilder.build(),
