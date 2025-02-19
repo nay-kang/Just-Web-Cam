@@ -14,6 +14,10 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.ImageFormat
 import android.graphics.Paint
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.hardware.camera2.CameraAccessException
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
@@ -40,7 +44,9 @@ import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
 
-class CameraStreamService : Service() {
+class CameraStreamService : Service(),SensorEventListener {
+    private val LIGHT_CHANGE_THRESHOLD: Float = 5f
+    private var currentLightLevel: Float = -1000f
     private lateinit var cameraId: String
     private lateinit var cameraManager: CameraManager
     private var cameraDevice: CameraDevice? = null
@@ -50,6 +56,10 @@ class CameraStreamService : Service() {
     private val cameraThread = HandlerThread("CameraThread").apply { start() }
     private val frameQueue = LinkedBlockingQueue<ByteArray>(1)
     private lateinit var streamServer: StreamServer
+    private lateinit var sensorManager: SensorManager
+    private var lightSensor: Sensor? = null
+    private val imageProcessingThread = HandlerThread("ImageProcessing").apply { start() }
+    private val imageProcessingHandler = Handler(imageProcessingThread.looper)
 
     companion object {
         internal const val TAG = "CameraStreamService"
@@ -71,6 +81,9 @@ class CameraStreamService : Service() {
             8080
         )
 
+        sensorManager = getSystemService(SENSOR_SERVICE) as SensorManager
+        lightSensor = sensorManager.getDefaultSensor(Sensor.TYPE_LIGHT)
+
         Log.d(TAG, "Service onCreate")
     }
 
@@ -79,11 +92,13 @@ class CameraStreamService : Service() {
         when (intent?.action) {
             ACTION_START_STREAM -> {
                 startForegroundService() // Start as foreground service
+                sensorManager.registerListener(this,  lightSensor, SensorManager.SENSOR_DELAY_NORMAL)
                 streamServer.start()
             }
 
             ACTION_STOP_STREAM -> {
                 stopCameraStreaming()
+                sensorManager.unregisterListener(this)
                 stopForegroundService() // Stop foreground service and service itself
                 stopSelf() // Stop the service
             }
@@ -91,6 +106,64 @@ class CameraStreamService : Service() {
             else -> Log.w(TAG, "Unknown action: ${intent?.action}")
         }
         return START_STICKY // Or START_NOT_STICKY, depending on your needs
+    }
+
+    override fun onSensorChanged(event: SensorEvent?) {
+        event?.let {
+            if (it.sensor.type  == Sensor.TYPE_LIGHT) {
+                Log.d(TAG,"Light sensor changed: ${it.values[0]}")
+                val newLightLevel = it.values[0]
+                if (kotlin.math.abs(newLightLevel  - currentLightLevel) > LIGHT_CHANGE_THRESHOLD) {
+                    currentLightLevel = newLightLevel
+                    adjustExposureCompensation(newLightLevel)
+                }
+            }
+        }
+    }
+
+    private fun adjustExposureCompensation(lightLevel: Float) {
+        if(!this::cameraManager.isInitialized){
+            return
+        }
+        val cameraCharacteristics = cameraManager.getCameraCharacteristics(cameraId)
+        val maxExposureCompensation = cameraCharacteristics.get(
+            CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE
+        )?.upper?: 0
+        Log.d(TAG,"maxExposureCompensation: $maxExposureCompensation")
+        val targetExposureCompensation: Int = when {
+            lightLevel > 500f -> {
+                // Bright light, set exposure compensation to 0
+                0
+            }
+
+            lightLevel < 10f -> {
+                // Dark night, set exposure compensation to the maximum of 4 or the max available
+                minOf(maxExposureCompensation, 4)
+            }
+
+            else -> {
+                // Intermediate light, adjust the value as needed
+                ((500-lightLevel)/160).toInt()
+            }
+        }
+
+        // Update the exposure compensation in the capture request
+        captureSession?.let { session ->
+            try {
+                val requestBuilder = session.device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply  {
+                    addTarget(imageReader!!.surface)
+                    set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, targetExposureCompensation)
+                    Log.i(TAG,"Setting CONTROL_AE_EXPOSURE_COMPENSATION to: $targetExposureCompensation")
+                }
+                session.setRepeatingRequest(requestBuilder.build(),  null, cameraHandler)
+            } catch (e: CameraAccessException) {
+                Log.e(TAG, "Repeating capture request exception", e)
+            }
+        }
+    }
+
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {
+        //TODO("Not yet implemented")
     }
 
     private fun startForegroundService() {
@@ -197,14 +270,21 @@ class CameraStreamService : Service() {
                 2
             ).apply {
                 setOnImageAvailableListener({ reader ->
-                    val image = reader.acquireLatestImage()
-                    image?.let {
-                        cameraHandler.post {
-                            processAndQueueFrame(it)
-                            it.close()
+                    var image: Image? = null
+                    try {
+                        image = reader.acquireNextImage()
+                        image?.let { img ->
+                            imageProcessingHandler.post {
+                                processAndQueueFrame(img)
+                                img.close()
+                            }
                         }
+                    } catch (e: IllegalStateException) {
+                        Log.e(TAG, "ImageReader buffer full", e)
                     }
                 }, cameraHandler)
+
+
             }
 
             cameraManager.openCamera(cameraId, cameraStateCallback, cameraHandler)
@@ -389,6 +469,8 @@ class CameraStreamService : Service() {
                         )
                     }
 
+
+
                     val requestBuilder =
                         session.device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
                             addTarget(surface)
@@ -398,6 +480,16 @@ class CameraStreamService : Service() {
                                     it
                                 )
                             }
+
+                            set(
+                                CaptureRequest.CONTROL_AE_MODE,
+                                CaptureRequest.CONTROL_AE_MODE_ON
+                            )
+
+                            set(
+                                CaptureRequest.NOISE_REDUCTION_MODE,
+                                CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY
+                            )
                         }
                     session.setRepeatingRequest(
                         requestBuilder.build(),
