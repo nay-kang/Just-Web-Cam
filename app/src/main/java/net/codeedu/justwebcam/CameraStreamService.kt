@@ -69,14 +69,15 @@ class CameraStreamService : Service() {
 
         // Brightness thresholds (adjust these based on your testing)
         const val NORMAL_LIGHT_THRESHOLD = 180 // Bright light if average brightness > 180
-        const val DEEP_DARK_LIGHT_THRESHOLD = 30 // Deep dark light if average brightness < 30
+        const val DEEP_DARK_LIGHT_THRESHOLD = 35 // Deep dark light if average brightness < 35
 
         // Exposure time values (in nanoseconds)
-        const val VERY_LONG_EXPOSURE_TIME_NS = 200_000_000L // 200ms (adjust as needed)
+        const val VERY_LONG_EXPOSURE_TIME_NS = 300_000_000L // 300ms (adjust as needed)
 
         // FPS ranges
         val DEFAULT_FPS_RANGE = Range(10, 15)// Default FPS range
-        val VERY_LOW_FPS_RANGE = Range(5, 5) // Very low FPS range for very long
+        const val FRAME_DURATION = 1_000_000_000L / 5 // 5 FPS
+        val previewSize = Size(1280, 720)
     }
 
     override fun onCreate() {
@@ -152,6 +153,12 @@ class CameraStreamService : Service() {
             Thread.currentThread().interrupt()
         }
 
+        imageProcessingThread.quitSafely()
+        try {
+            imageProcessingThread.join()
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
         Log.d(TAG, "Service onDestroy")
     }
 
@@ -186,8 +193,7 @@ class CameraStreamService : Service() {
             setupCamera()
         } else {
             Log.w(TAG, "Camera permission not granted, cannot start camera")
-            // In a service context, you might want to handle permission differently,
-            // perhaps by sending a broadcast or using a different mechanism to inform the Activity.
+            // TODO inform the Activity.
         }
     }
 
@@ -201,6 +207,7 @@ class CameraStreamService : Service() {
     }
 
     private fun setupCamera() {
+        lastLightLevel = LightLevel.NORMAL
         cameraManager = getSystemService(CAMERA_SERVICE) as CameraManager
         try {
             val cameraIds = cameraManager.cameraIdList
@@ -208,7 +215,6 @@ class CameraStreamService : Service() {
                 val characteristics = cameraManager.getCameraCharacteristics(id)
                 characteristics.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
             } ?: throw IllegalStateException("Back camera not found")
-            val previewSize = Size(1280, 720)
 
             imageReader = ImageReader.newInstance(
                 previewSize.width,
@@ -240,6 +246,8 @@ class CameraStreamService : Service() {
             Log.e(TAG, "Illegal argument exception", e)
         } catch (e: SecurityException) {
             Log.e(TAG, "Security exception", e)
+        } catch (e: IllegalStateException) {
+            Log.e(TAG, "Illegal State Exception: ${e.message}", e)
         }
 
     }
@@ -283,7 +291,8 @@ class CameraStreamService : Service() {
         bitmap.recycle()
 
         val canvas = Canvas(mutableBitmap)
-        val textPaint = Paint().apply {
+        val paint = Paint()
+        val textPaint = paint.apply {
             color = Color.WHITE // Main text color is white
             textSize = 40f
             isAntiAlias = true
@@ -291,7 +300,7 @@ class CameraStreamService : Service() {
         }
 
         // Create a Paint for the black border/stroke
-        val borderPaint = Paint().apply {
+        val borderPaint = paint.apply {
             color = Color.BLACK // Border color is black
             textSize = 40f // Must match textPaint's textSize
             isAntiAlias = true
@@ -344,29 +353,41 @@ class CameraStreamService : Service() {
         return if (sampleCount > 0) (totalBrightness / sampleCount).toInt() else 0
     }
 
+    private fun rangeArrayToStr(ranges: Array<Range<Int>>?): String {
+        val rangesString =
+            ranges?.joinToString(separator = ", ", prefix = "[", postfix = "]") { range ->
+                "${range.lower}..${range.upper}"
+            }
+        return rangesString ?: "null"
+    }
+
     private fun adjustExposure(lightLevel: LightLevel) {
 
         captureSession?.let { session ->
             try {
-                val cameraCharacteristics = cameraManager.getCameraCharacteristics(cameraId)
-                val exposureTimeRange =
-                    cameraCharacteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
-                val fpsRanges =
-                    cameraCharacteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
-                val isoRange =
-                    cameraCharacteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
-
-                if (exposureTimeRange == null || fpsRanges == null) {
-                    Log.e(TAG, "Exposure time range or FPS ranges not supported")
-                    return
-                }
                 var requestBuilder: CaptureRequest.Builder? = null
                 if (lightLevel == LightLevel.DEEP_DARK) {
-                    val clampedExposureTime = VERY_LONG_EXPOSURE_TIME_NS.coerceIn(
-                        exposureTimeRange.lower.toLong(),
-                        exposureTimeRange.upper.toLong()
+                    val cameraCharacteristics = cameraManager.getCameraCharacteristics(cameraId)
+                    val exposureTimeRange =
+                        cameraCharacteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
+                    val fpsRanges =
+                        cameraCharacteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+                    val isoRange =
+                        cameraCharacteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
+                    Log.d(
+                        TAG,
+                        "Exposure time range: $exposureTimeRange, FPS ranges: ${
+                            rangeArrayToStr(fpsRanges)
+                        }"
                     )
-                    Log.d(TAG, "Clamped Exposure Time: $clampedExposureTime")
+                    if (exposureTimeRange == null || fpsRanges == null) {
+                        Log.e(TAG, "Exposure time range or FPS ranges not supported")
+                        return
+                    }
+                    val desiredExposure = VERY_LONG_EXPOSURE_TIME_NS.coerceIn(
+                        exposureTimeRange.lower,
+                        exposureTimeRange.upper
+                    )
                     requestBuilder =
                         cameraDevice?.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
                             ?.apply {
@@ -381,17 +402,14 @@ class CameraStreamService : Service() {
                                 ) // Turn off auto-exposure
                                 set(
                                     CaptureRequest.SENSOR_EXPOSURE_TIME,
-                                    VERY_LONG_EXPOSURE_TIME_NS
+                                    desiredExposure
                                 ) // Set exposure time
                                 set(
                                     CaptureRequest.NOISE_REDUCTION_MODE,
                                     CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY
                                 )
-                                set(
-                                    CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
-                                    VERY_LOW_FPS_RANGE
-                                ) // Set FPS range
                                 set(CaptureRequest.SENSOR_SENSITIVITY, isoRange?.upper ?: 800)
+                                set(CaptureRequest.SENSOR_FRAME_DURATION, FRAME_DURATION)
 
                             }
                 } else {
