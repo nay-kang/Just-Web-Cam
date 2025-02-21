@@ -291,8 +291,7 @@ class CameraStreamService : Service() {
         bitmap.recycle()
 
         val canvas = Canvas(mutableBitmap)
-        val paint = Paint()
-        val textPaint = paint.apply {
+        val textPaint = Paint().apply {
             color = Color.WHITE // Main text color is white
             textSize = 40f
             isAntiAlias = true
@@ -300,7 +299,7 @@ class CameraStreamService : Service() {
         }
 
         // Create a Paint for the black border/stroke
-        val borderPaint = paint.apply {
+        val borderPaint = Paint().apply {
             color = Color.BLACK // Border color is black
             textSize = 40f // Must match textPaint's textSize
             isAntiAlias = true
@@ -432,6 +431,8 @@ class CameraStreamService : Service() {
                     )
                 }
             } catch (e: CameraAccessException) {
+                Log.e(TAG, "Failed to adjust exposure", e)
+            } catch (e: IllegalStateException) {
                 Log.e(TAG, "Failed to adjust exposure", e)
             }
         }
