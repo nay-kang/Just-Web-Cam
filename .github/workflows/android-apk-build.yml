@@ -22,11 +22,6 @@ jobs: # Define the jobs to be executed in this workflow
           java-version: '17' # Specify Java version (adjust as needed for your project)
           distribution: 'temurin' # Distribution of Java to use (Temurin is a popular OpenJDK build)
 
-      - name: Set up Android SDK # Step name
-        uses: android-actions/setup-android@v3 # Action to set up Android SDK
-        with:
-          sdkVersion: '35' # Specify Android SDK version (adjust to your project's compileSdkVersion)
-
       - name: Grant execute permission for gradlew # Step name
         run: chmod +x gradlew # Make the Gradle wrapper executable
 
@@ -37,6 +32,10 @@ jobs: # Define the jobs to be executed in this workflow
 
       - name: Build APK # Step name
         run: ./gradlew assembleRelease # Command to build the release APK using Gradle wrapper
+        env:
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
 
       - name: Upload APK # Step name
         uses: actions/upload-artifact@v4 # Action to upload artifacts (files) from the workflow
