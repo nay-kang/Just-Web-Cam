@@ -32,8 +32,8 @@ jobs: # Define the jobs to be executed in this workflow
 
       - name: Decode and Store Signing Key # New Step to decode and save keystore
         run: |
-          mkdir signing
-          echo "${{ secrets.SIGNING_KEYSTORE }}" | base64 -d > signing/release.jks
+          mkdir app/signing
+          echo "${{ secrets.SIGNING_KEYSTORE }}" | base64 -d > app/signing/release.jks
 
       - name: Build APK # Step name
         run: ./gradlew assembleRelease # Command to build the release APK using Gradle wrapper
