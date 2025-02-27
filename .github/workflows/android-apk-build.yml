@@ -1,0 +1,42 @@
+name: Android APK Build # Workflow name, will be displayed in GitHub Actions
+
+on: # Define when this workflow will run
+  push:
+    branches:
+      - 'release/**'
+
+jobs: # Define the jobs to be executed in this workflow
+  build: # Job name, can be anything descriptive
+    runs-on: ubuntu-latest # Operating system to run the job on (Ubuntu is common for Android builds)
+
+    steps: # Define the steps within the 'build' job
+      - name: Checkout code # Step name, descriptive
+        uses: actions/checkout@v4 # Action to checkout the repository code into the workflow environment
+
+      - name: Set up JDK # Step name
+        uses: actions/setup-java@v4 # Action to set up Java environment
+        with:
+          java-version: '17' # Specify Java version (adjust as needed for your project)
+          distribution: 'temurin' # Distribution of Java to use (Temurin is a popular OpenJDK build)
+
+      - name: Set up Android SDK # Step name
+        uses: android-actions/setup-android@v3 # Action to set up Android SDK
+        with:
+          sdkVersion: '35' # Specify Android SDK version (adjust to your project's compileSdkVersion)
+
+      - name: Grant execute permission for gradlew # Step name
+        run: chmod +x gradlew # Make the Gradle wrapper executable
+
+      - name: Decode and Store Signing Key # New Step to decode and save keystore
+        run: |
+          mkdir signing
+          echo "${{ secrets.SIGNING_KEYSTORE }}" | base64 -d > signing/release.jks
+
+      - name: Build APK # Step name
+        run: ./gradlew assembleRelease # Command to build the release APK using Gradle wrapper
+
+      - name: Upload APK # Step name
+        uses: actions/upload-artifact@v4 # Action to upload artifacts (files) from the workflow
+        with:
+          name: release-apk # Name for the artifact
+          path: app/build/outputs/apk/release/app-release.apk # Path to the generated APK file (adjust if your app's output path is different)
