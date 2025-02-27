@@ -5,6 +5,9 @@ on: # Define when this workflow will run
     branches:
       - 'release/**'
 
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
 jobs: # Define the jobs to be executed in this workflow
   build: # Job name, can be anything descriptive
     runs-on: ubuntu-latest # Operating system to run the job on (Ubuntu is common for Android builds)
