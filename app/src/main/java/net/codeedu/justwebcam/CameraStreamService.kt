@@ -58,6 +58,12 @@ class CameraStreamService : Service() {
 
     private var showTimestampOverlay = true
 
+    // Reuse ByteArrayOutputStream
+    private val jpegOutputStream = ByteArrayOutputStream()
+
+    // Cache SimpleDateFormat
+    private val timestampFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
+
     private enum class LightLevel {
         NORMAL, DEEP_DARK, KEEP
     }
@@ -81,7 +87,8 @@ class CameraStreamService : Service() {
         const val FRAME_DURATION = 1_000_000_000L / 5 // 5 FPS
         val previewSize = Size(1280, 720)
 
-        const val ACTION_UPDATE_TIMESTAMP_STATE = "net.codeedu.justwebcam.ACTION_UPDATE_TIMESTAMP_STATE"
+        const val ACTION_UPDATE_TIMESTAMP_STATE =
+            "net.codeedu.justwebcam.ACTION_UPDATE_TIMESTAMP_STATE"
         const val EXTRA_SHOW_TIMESTAMP = "net.codeedu.justwebcam.EXTRA_SHOW_TIMESTAMP"
     }
 
@@ -105,7 +112,7 @@ class CameraStreamService : Service() {
         when (intent?.action) {
             ACTION_START_STREAM -> {
                 startForegroundService() // Start as foreground service
-                showTimestampOverlay = intent.getBooleanExtra(EXTRA_SHOW_TIMESTAMP,true);
+                showTimestampOverlay = intent.getBooleanExtra(EXTRA_SHOW_TIMESTAMP, true)
                 streamServer.start()
             }
 
@@ -119,6 +126,7 @@ class CameraStreamService : Service() {
                 showTimestampOverlay = intent.getBooleanExtra(EXTRA_SHOW_TIMESTAMP, true)
                 Log.d(TAG, "Timestamp overlay state updated to: $showTimestampOverlay")
             }
+
             else -> Log.w(TAG, "Unknown action: ${intent?.action}")
         }
         return START_STICKY // Or START_NOT_STICKY, depending on your needs
@@ -233,9 +241,8 @@ class CameraStreamService : Service() {
                 2
             ).apply {
                 setOnImageAvailableListener({ reader ->
-                    var image: Image? = null
                     try {
-                        image = reader.acquireNextImage()
+                        val image = reader.acquireLatestImage()
                         image?.let { img ->
                             imageProcessingHandler.post {
                                 processAndQueueFrame(img)
@@ -267,6 +274,22 @@ class CameraStreamService : Service() {
         return batteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
     }
 
+    private val textPaint = Paint().apply {
+        color = Color.WHITE
+        textSize = 40f
+        isAntiAlias = true
+        style = Paint.Style.FILL
+        textAlign = Paint.Align.LEFT // Initialize alignment
+    }
+    private val borderPaint = Paint().apply {
+        color = Color.BLACK
+        textSize = 40f
+        isAntiAlias = true
+        style = Paint.Style.STROKE
+        strokeWidth = 5f
+        textAlign = Paint.Align.LEFT // Initialize alignment
+    }
+
     private fun processAndQueueFrame(image: Image) {
         frameCounter++
         if (frameCounter % 15 == 0) { // Calculate brightness every 15 frames
@@ -291,59 +314,32 @@ class CameraStreamService : Service() {
             }
         }
 
-        val bitmap = imageToBitmap(image) ?: return
-        // Create a mutable bitmap to draw on
-        val mutableBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, true)
-        bitmap.recycle()
-        val canvas = Canvas(mutableBitmap)
+        val mutableBitmap = imageToMutableBitmap(image) ?: return
 
-        if(showTimestampOverlay) {
-            var timestamp =
-                SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date())
+        if (showTimestampOverlay) {
+            val canvas = Canvas(mutableBitmap)
+            var timestamp = timestampFormat.format(Date())
             timestamp += " ${getBatteryPercentage()}%\uD83D\uDD0B"
-
-            image.close()
-
-            val textPaint = Paint().apply {
-                color = Color.WHITE // Main text color is white
-                textSize = 40f
-                isAntiAlias = true
-                style = Paint.Style.FILL // Default style is FILL for the main text
-            }
-
-            // Create a Paint for the black border/stroke
-            val borderPaint = Paint().apply {
-                color = Color.BLACK // Border color is black
-                textSize = 40f // Must match textPaint's textSize
-                isAntiAlias = true
-                style = Paint.Style.STROKE // Style to STROKE for border
-                strokeWidth = 5f // Border width (adjust as needed)
-            }
-
             val x = 20f
             val y = 50f
-
-            // Draw black text outline (border) first
-            borderPaint.textAlign =
-                Paint.Align.LEFT // Align text to the left for consistent positioning
             canvas.drawText(timestamp, x, y, borderPaint)
-
-            // Draw white text on top (fill)
-            textPaint.textAlign = Paint.Align.LEFT // Ensure same alignment as border
             canvas.drawText(timestamp, x, y, textPaint)
         }
-        val outputStream = ByteArrayOutputStream()
-        mutableBitmap.compress(Bitmap.CompressFormat.JPEG, 50, outputStream)
-        val modifiedJpegBytes = outputStream.toByteArray()
-        outputStream.closeSafely()
-        mutableBitmap.recycle()
 
-        frameQueue.offer(modifiedJpegBytes)
+        jpegOutputStream.reset() // Reuse the stream
+        mutableBitmap.compress(
+            Bitmap.CompressFormat.JPEG,
+            50,
+            jpegOutputStream
+        ) // Final compression
+        val finalJpegBytes = jpegOutputStream.toByteArray() // Get bytes
+        mutableBitmap.recycle()
+        frameQueue.offer(finalJpegBytes)
     }
 
     private fun calculateAverageBrightnessOptimized(image: Image): Int {
         val yPlane = image.planes[0]
-        val yBuffer = yPlane.buffer
+        val yBuffer = yPlane.buffer.asReadOnlyBuffer() // Use asReadOnlyBuffer for safety if needed
         val rowStride = yPlane.rowStride
         val pixelStride = yPlane.pixelStride
         val width = image.width
@@ -351,14 +347,28 @@ class CameraStreamService : Service() {
 
         var totalBrightness = 0L
         var sampleCount = 0
-        val sampleStep = 8 // Sample every 8th pixel in both dimensions
+        val sampleStep = 16 // Sample every 16th pixel
+
+        // Important: Rewind buffer before reading if it might have been read elsewhere
+        yBuffer.rewind()
 
         for (y in 0 until height step sampleStep) {
+            val rowStart = y * rowStride
             for (x in 0 until width step sampleStep) {
-                val pixelIndex = y * rowStride + x * pixelStride
-                val yValue = yBuffer.get(pixelIndex).toInt() and 0xFF // Ensure value is unsigned
-                totalBrightness += yValue
-                sampleCount++
+                try {
+                    val pixelIndex = rowStart + x * pixelStride
+                    // Check index bounds carefully, especially near edges with strides
+                    if (pixelIndex < yBuffer.capacity()) {
+                        val yValue = yBuffer.get(pixelIndex).toInt() and 0xFF
+                        totalBrightness += yValue
+                        sampleCount++
+                    } else {
+                        // Log.w(TAG, "Skipping pixel out of bounds: x=$x, y=$y, index=$pixelIndex, capacity=${yBuffer.capacity()}")
+                    }
+                } catch (e: IndexOutOfBoundsException) {
+                    // Log.e(TAG, "Index out of bounds during brightness calc: x=$x, y=$y, index=$rowStart + $x * $pixelStride", e)
+                    // break inner loop or handle appropriately
+                }
             }
         }
 
@@ -377,7 +387,7 @@ class CameraStreamService : Service() {
 
         captureSession?.let { session ->
             try {
-                var requestBuilder: CaptureRequest.Builder? = null
+                val requestBuilder: CaptureRequest.Builder?
                 if (lightLevel == LightLevel.DEEP_DARK) {
                     val cameraCharacteristics = cameraManager.getCameraCharacteristics(cameraId)
                     val exposureTimeRange =
@@ -451,7 +461,11 @@ class CameraStreamService : Service() {
         }
     }
 
-    private fun imageToBitmap(image: Image): Bitmap? {
+    private fun imageToMutableBitmap(image: Image): Bitmap? {
+        if (image.format != ImageFormat.YUV_420_888) {
+            Log.e(TAG, "Unexpected image format: ${image.format}")
+            return null
+        }
         val planes = image.planes
         val yBuffer = planes[0].buffer
         val uBuffer = planes[1].buffer
@@ -464,7 +478,7 @@ class CameraStreamService : Service() {
         val nv21 = ByteArray(ySize + uSize + vSize)
 
         yBuffer.get(nv21, 0, ySize)
-        vBuffer.get(nv21, ySize, vSize)
+        vBuffer.get(nv21, ySize, vSize) // V before U for NV21
         uBuffer.get(nv21, ySize + vSize, uSize)
 
         val yuvImage = android.graphics.YuvImage(
@@ -475,21 +489,31 @@ class CameraStreamService : Service() {
             null
         )
 
-        ByteArrayOutputStream().use { out -> // Use 'use' to auto-close ByteArrayOutputStream
+        // Use a temporary BAOS for the intermediate JPEG
+        val intermediateJpegStream = ByteArrayOutputStream()
+        try {
             yuvImage.compressToJpeg(
                 android.graphics.Rect(0, 0, image.width, image.height),
-                90,
-                out
+                90, // Intermediate quality - balance speed vs final quality
+                intermediateJpegStream
             )
-            val imageBytes = out.toByteArray()
+            val imageBytes = intermediateJpegStream.toByteArray()
 
-            val decodedBitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
-            return decodedBitmap?.copy(Bitmap.Config.ARGB_8888, true)?.apply {
-                decodedBitmap.recycle() // Recycle original decodedBitmap
-            } ?: run {
-                Log.e(TAG, "Failed to decode image bytes into Bitmap")
-                null
+            // Decode DIRECTLY to a mutable bitmap config if needed downstream
+            val options = BitmapFactory.Options().apply {
+                inMutable = true
+                inPreferredConfig = Bitmap.Config.ARGB_8888 // Ensures mutable ARGB for Canvas
             }
+            val bitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size, options)
+            if (bitmap == null) {
+                Log.e(TAG, "Failed to decode intermediate JPEG")
+            }
+            return bitmap // Return the mutable bitmap
+        } catch (e: Exception) {
+            Log.e(TAG, "Error during YUV->Bitmap conversion", e)
+            return null
+        } finally {
+            intermediateJpegStream.closeSafely() // Close the temp stream
         }
     }
 
