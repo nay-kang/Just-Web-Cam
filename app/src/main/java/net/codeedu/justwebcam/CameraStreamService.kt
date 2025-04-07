@@ -56,6 +56,8 @@ class CameraStreamService : Service() {
     private var frameCounter = 0
     private var lastLightLevel = LightLevel.NORMAL // Initialize with bright light
 
+    private var showTimestampOverlay = true
+
     private enum class LightLevel {
         NORMAL, DEEP_DARK, KEEP
     }
@@ -78,6 +80,9 @@ class CameraStreamService : Service() {
         val DEFAULT_FPS_RANGE = Range(10, 15)// Default FPS range
         const val FRAME_DURATION = 1_000_000_000L / 5 // 5 FPS
         val previewSize = Size(1280, 720)
+
+        const val ACTION_UPDATE_TIMESTAMP_STATE = "net.codeedu.justwebcam.ACTION_UPDATE_TIMESTAMP_STATE"
+        const val EXTRA_SHOW_TIMESTAMP = "net.codeedu.justwebcam.EXTRA_SHOW_TIMESTAMP"
     }
 
     override fun onCreate() {
@@ -100,6 +105,7 @@ class CameraStreamService : Service() {
         when (intent?.action) {
             ACTION_START_STREAM -> {
                 startForegroundService() // Start as foreground service
+                showTimestampOverlay = intent.getBooleanExtra(EXTRA_SHOW_TIMESTAMP,true);
                 streamServer.start()
             }
 
@@ -109,6 +115,10 @@ class CameraStreamService : Service() {
                 stopSelf() // Stop the service
             }
 
+            ACTION_UPDATE_TIMESTAMP_STATE -> {
+                showTimestampOverlay = intent.getBooleanExtra(EXTRA_SHOW_TIMESTAMP, true)
+                Log.d(TAG, "Timestamp overlay state updated to: $showTimestampOverlay")
+            }
             else -> Log.w(TAG, "Unknown action: ${intent?.action}")
         }
         return START_STICKY // Or START_NOT_STICKY, depending on your needs
@@ -281,44 +291,47 @@ class CameraStreamService : Service() {
             }
         }
 
-        var timestamp = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date())
-        timestamp += " ${getBatteryPercentage()}%\uD83D\uDD0B"
         val bitmap = imageToBitmap(image) ?: return
-        image.close()
-
         // Create a mutable bitmap to draw on
         val mutableBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, true)
         bitmap.recycle()
-
         val canvas = Canvas(mutableBitmap)
-        val textPaint = Paint().apply {
-            color = Color.WHITE // Main text color is white
-            textSize = 40f
-            isAntiAlias = true
-            style = Paint.Style.FILL // Default style is FILL for the main text
+
+        if(showTimestampOverlay) {
+            var timestamp =
+                SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date())
+            timestamp += " ${getBatteryPercentage()}%\uD83D\uDD0B"
+
+            image.close()
+
+            val textPaint = Paint().apply {
+                color = Color.WHITE // Main text color is white
+                textSize = 40f
+                isAntiAlias = true
+                style = Paint.Style.FILL // Default style is FILL for the main text
+            }
+
+            // Create a Paint for the black border/stroke
+            val borderPaint = Paint().apply {
+                color = Color.BLACK // Border color is black
+                textSize = 40f // Must match textPaint's textSize
+                isAntiAlias = true
+                style = Paint.Style.STROKE // Style to STROKE for border
+                strokeWidth = 5f // Border width (adjust as needed)
+            }
+
+            val x = 20f
+            val y = 50f
+
+            // Draw black text outline (border) first
+            borderPaint.textAlign =
+                Paint.Align.LEFT // Align text to the left for consistent positioning
+            canvas.drawText(timestamp, x, y, borderPaint)
+
+            // Draw white text on top (fill)
+            textPaint.textAlign = Paint.Align.LEFT // Ensure same alignment as border
+            canvas.drawText(timestamp, x, y, textPaint)
         }
-
-        // Create a Paint for the black border/stroke
-        val borderPaint = Paint().apply {
-            color = Color.BLACK // Border color is black
-            textSize = 40f // Must match textPaint's textSize
-            isAntiAlias = true
-            style = Paint.Style.STROKE // Style to STROKE for border
-            strokeWidth = 5f // Border width (adjust as needed)
-        }
-
-        val x = 20f
-        val y = 50f
-
-        // Draw black text outline (border) first
-        borderPaint.textAlign =
-            Paint.Align.LEFT // Align text to the left for consistent positioning
-        canvas.drawText(timestamp, x, y, borderPaint)
-
-        // Draw white text on top (fill)
-        textPaint.textAlign = Paint.Align.LEFT // Ensure same alignment as border
-        canvas.drawText(timestamp, x, y, textPaint)
-
         val outputStream = ByteArrayOutputStream()
         mutableBitmap.compress(Bitmap.CompressFormat.JPEG, 50, outputStream)
         val modifiedJpegBytes = outputStream.toByteArray()

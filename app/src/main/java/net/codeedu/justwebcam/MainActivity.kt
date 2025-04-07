@@ -3,67 +3,101 @@ package net.codeedu.justwebcam
 import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
+import android.widget.Switch
 import android.widget.TextView
+import android.widget.ToggleButton
 import androidx.activity.ComponentActivity
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
-import android.widget.ToggleButton
 import java.net.Inet4Address
 import java.net.NetworkInterface
-import java.util.Collections
+import androidx.core.content.edit
 
 class MainActivity : ComponentActivity() {
 
     private lateinit var multiplePermissionsResultLauncher: ActivityResultLauncher<Array<String>>
     private var isStreaming = false // Track streaming state
-    private lateinit var streamSwitchButton: ToggleButton // Switch button
-    private lateinit var ipAddressTextView: TextView // TextView for IP address
+    private lateinit var streamToggleButton: ToggleButton
+    private lateinit var ipAddressTextView: TextView
+    private lateinit var timestampSwitch: Switch
+    private lateinit var sharedPreferences: SharedPreferences
+
+    // Use constants for keys
+    companion object {
+        private const val TAG = "MainActivity"
+        private const val TIMESTAMP_STATE_KEY = "timestamp_state"
+        private const val PREF_FILE_KEY = "main_activity_prefs"
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main) // Ensure you have activity_main.xml layout
+        setContentView(R.layout.activity_main)
 
-        streamSwitchButton = findViewById(R.id.streamSwitchButton) // Switch button findViewById
-        ipAddressTextView = findViewById(R.id.ipAddressTextView) // IP address TextView findViewById
+        initializeViews()
+        initializeSharedPreferences()
+        initializePermissionLauncher()
+        requestPermissionsIfNeeded()
+        setupListeners()
+        updateUIState()
+    }
 
+    private fun initializeViews() {
+        streamToggleButton = findViewById(R.id.streamSwitchButton)
+        ipAddressTextView = findViewById(R.id.ipAddressTextView)
+        timestampSwitch = findViewById(R.id.timestampSwitch)
+    }
+
+    private fun initializeSharedPreferences() {
+        sharedPreferences = getSharedPreferences(PREF_FILE_KEY, Context.MODE_PRIVATE)
+        val savedTimestampState = sharedPreferences.getBoolean(TIMESTAMP_STATE_KEY, true)
+        timestampSwitch.isChecked = savedTimestampState
+    }
+
+    private fun initializePermissionLauncher() {
         multiplePermissionsResultLauncher = registerForActivityResult(
             ActivityResultContracts.RequestMultiplePermissions()
         ) { permissions ->
-            val cameraPermissionGranted = permissions[Manifest.permission.CAMERA] ?: false
-            val notificationPermissionGranted =
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    permissions[Manifest.permission.POST_NOTIFICATIONS] ?: false
-                } else {
-                    true // On older versions, POST_NOTIFICATIONS is not needed
-                }
+            handlePermissionResult(permissions)
+        }
+    }
 
-            if (cameraPermissionGranted) {
-                Log.d(TAG, "Camera permission granted")
-            } else {
-                Log.e(TAG, "Camera permission denied")
-                // Inform user, disable streaming features if camera permission is essential
-            }
-
+    private fun handlePermissionResult(permissions: Map<String, Boolean>) {
+        val cameraPermissionGranted = permissions[Manifest.permission.CAMERA] ?: false
+        val notificationPermissionGranted =
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                if (notificationPermissionGranted) {
-                    Log.d(TAG, "Notification permission granted")
-                } else {
-                    Log.e(TAG, "Notification permission denied")
-                    // Inform user notifications might be disabled
-                }
+                permissions[Manifest.permission.POST_NOTIFICATIONS] ?: false
+            } else {
+                true
             }
-            updateUIState() // Update UI based on permissions
+
+        if (cameraPermissionGranted) {
+            Log.d(TAG, "Camera permission granted")
+        } else {
+            Log.e(TAG, "Camera permission denied")
+            // Provide user feedback about why camera permission is needed.
         }
 
-        /* Request camera and notification permissions together at startup */
-        val permissionsToRequest = mutableListOf<String>(Manifest.permission.CAMERA)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (notificationPermissionGranted) {
+                Log.d(TAG, "Notification permission granted")
+            } else {
+                Log.e(TAG, "Notification permission denied")
+                // Provide user feedback about why notification permission is needed.
+            }
+        }
+        updateUIState()
+    }
+
+    private fun requestPermissionsIfNeeded() {
+        val permissionsToRequest = mutableListOf(Manifest.permission.CAMERA)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             permissionsToRequest.add(Manifest.permission.POST_NOTIFICATIONS)
         }
@@ -72,21 +106,36 @@ class MainActivity : ComponentActivity() {
             ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
         }
 
-        if (permissionsAlreadyGranted) {
-            Log.d(TAG, "Both Camera and Notification permissions already granted at startup")
-        } else {
+        if (!permissionsAlreadyGranted) {
             multiplePermissionsResultLauncher.launch(permissionsToRequest.toTypedArray())
+        } else {
+            Log.d(TAG, "Camera and Notification permissions already granted")
+        }
+    }
+
+    private fun setupListeners() {
+        streamToggleButton.setOnCheckedChangeListener { _, isChecked ->
+            handleStreamToggle(isChecked)
         }
 
-        streamSwitchButton.setOnCheckedChangeListener { _, isChecked -> // Switch listener
-            if (isChecked) {
-                startStreamingService()
-            } else {
-                stopStreamingService()
-            }
+        timestampSwitch.setOnCheckedChangeListener { _, isChecked ->
+            handleTimestampSwitchChange(isChecked)
         }
+    }
 
-        updateUIState() // Initial UI state
+    private fun handleStreamToggle(isChecked: Boolean) {
+        if (isChecked) {
+            startStreamingService()
+        } else {
+            stopStreamingService()
+        }
+    }
+
+    private fun handleTimestampSwitchChange(isChecked: Boolean) {
+        sharedPreferences.edit { putBoolean(TIMESTAMP_STATE_KEY, isChecked) }
+        if (isStreaming) {
+            sendTimestampSwitchStateToService(isChecked)
+        }
     }
 
     private fun startStreamingService() {
@@ -95,70 +144,64 @@ class MainActivity : ComponentActivity() {
                 Manifest.permission.CAMERA
             ) == PackageManager.PERMISSION_GRANTED
         ) {
-            Intent(this, CameraStreamService::class.java).also { intent ->
-                intent.action = CameraStreamService.ACTION_START_STREAM // Use action to start
-                ContextCompat.startForegroundService(this, intent) // Start as foreground service
+            Intent(this, CameraStreamService::class.java).apply {
+                action = CameraStreamService.ACTION_START_STREAM
+                putExtra(CameraStreamService.EXTRA_SHOW_TIMESTAMP, timestampSwitch.isChecked)
+                ContextCompat.startForegroundService(this@MainActivity, this)
             }
             isStreaming = true
             updateUIState()
         } else {
             Log.w(TAG, "Camera permission not granted, cannot start streaming")
-            // Optionally, request permission again or inform user
-            multiplePermissionsResultLauncher.launch(arrayOf(Manifest.permission.CAMERA)) // Re-request if needed (only camera this time for start attempt)
+            multiplePermissionsResultLauncher.launch(arrayOf(Manifest.permission.CAMERA))
         }
     }
 
     private fun stopStreamingService() {
-        Intent(this, CameraStreamService::class.java).also { intent ->
-            intent.action = CameraStreamService.ACTION_STOP_STREAM // Use action to stop
-            startService(intent) // No need for foreground context to stop
+        Intent(this, CameraStreamService::class.java).apply {
+            action = CameraStreamService.ACTION_STOP_STREAM
+            startService(this)
         }
         isStreaming = false
         updateUIState()
     }
 
     private fun updateUIState() {
-        streamSwitchButton.isEnabled =
-            ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.CAMERA
-            ) == PackageManager.PERMISSION_GRANTED
-
-        streamSwitchButton.isChecked = isStreaming // Set switch state
-
-        ipAddressTextView.text = getString(R.string.http_address_label,getIPv4Address()) // Update IP address
+        streamToggleButton.isEnabled = ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.CAMERA
+        ) == PackageManager.PERMISSION_GRANTED
+        streamToggleButton.isChecked = isStreaming
+        ipAddressTextView.text = getString(R.string.http_address_label, getIPv4Address())
     }
 
     private fun getIPv4Address(): String? {
         val connectivityManager =
             getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         val network = connectivityManager.activeNetwork ?: return null
-        val capabilities =
-            connectivityManager.getNetworkCapabilities(network) ?: return null
+        val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return null
+
         if (!capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return null
 
-        NetworkInterface.getNetworkInterfaces()?.let { interfaces ->
-            Collections.list(interfaces).forEach { iface ->
-                if (iface.isUp && iface.name == "wlan0") { // "wlan0" is typical Wi-Fi interface
-                    Collections.list(iface.inetAddresses).forEach { addr ->
-                        if (!addr.isLoopbackAddress && addr is Inet4Address) {
-                            return addr.hostAddress
-                        }
-                    }
-                }
-            }
+        return NetworkInterface.getNetworkInterfaces()?.toList()?.firstOrNull {
+            it.isUp && it.name == "wlan0"
+        }?.inetAddresses?.toList()?.firstOrNull {
+            !it.isLoopbackAddress && it is Inet4Address
+        }?.hostAddress
+    }
+
+    private fun sendTimestampSwitchStateToService(showTimestamp: Boolean) {
+        Intent(this, CameraStreamService::class.java).apply {
+            action = CameraStreamService.ACTION_UPDATE_TIMESTAMP_STATE
+            putExtra(CameraStreamService.EXTRA_SHOW_TIMESTAMP, showTimestamp)
+            startService(this)
         }
-        return null
     }
 
     override fun onDestroy() {
         super.onDestroy()
         if (isStreaming) {
-            stopStreamingService() // Ensure service is stopped when Activity is destroyed (optional, depends on desired behavior)
+            stopStreamingService()
         }
-    }
-
-    companion object {
-        private const val TAG = "MainActivity"
     }
 }

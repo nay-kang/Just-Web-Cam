@@ -24,7 +24,7 @@ android {
             storePassword=System.getenv("SIGNING_STORE_PASSWORD")
             keyAlias=System.getenv("SIGNING_KEY_ALIAS")
             keyPassword=System.getenv("SIGNING_KEY_PASSWORD")
-            
+
             enableV3Signing = true // Enable V3 signing
             enableV4Signing = true // Enable V4 signing
         }
