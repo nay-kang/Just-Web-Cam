@@ -28,12 +28,14 @@ class MainActivity : ComponentActivity() {
     private lateinit var streamToggleButton: ToggleButton
     private lateinit var ipAddressTextView: TextView
     private lateinit var timestampSwitch: Switch
+    private lateinit var autoStartSwitch: Switch
     private lateinit var sharedPreferences: SharedPreferences
 
     // Use constants for keys
     companion object {
         private const val TAG = "MainActivity"
         private const val TIMESTAMP_STATE_KEY = "timestamp_state"
+        private const val AUTO_START_STATE_KEY = "auto_start_state"
         private const val PREF_FILE_KEY = "main_activity_prefs"
     }
 
@@ -53,12 +55,16 @@ class MainActivity : ComponentActivity() {
         streamToggleButton = findViewById(R.id.streamSwitchButton)
         ipAddressTextView = findViewById(R.id.ipAddressTextView)
         timestampSwitch = findViewById(R.id.timestampSwitch)
+        autoStartSwitch = findViewById(R.id.autoStartSwitch)
     }
 
     private fun initializeSharedPreferences() {
         sharedPreferences = getSharedPreferences(PREF_FILE_KEY, MODE_PRIVATE)
         val savedTimestampState = sharedPreferences.getBoolean(TIMESTAMP_STATE_KEY, true)
         timestampSwitch.isChecked = savedTimestampState
+
+        val savedAutoStartState = sharedPreferences.getBoolean(AUTO_START_STATE_KEY, false)
+        autoStartSwitch.isChecked = savedAutoStartState
     }
 
     private fun initializePermissionLauncher() {
@@ -82,7 +88,6 @@ class MainActivity : ComponentActivity() {
             Log.d(TAG, "Camera permission granted")
         } else {
             Log.e(TAG, "Camera permission denied")
-            // Provide user feedback about why camera permission is needed.
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -90,10 +95,22 @@ class MainActivity : ComponentActivity() {
                 Log.d(TAG, "Notification permission granted")
             } else {
                 Log.e(TAG, "Notification permission denied")
-                // Provide user feedback about why notification permission is needed.
             }
         }
         updateUIState()
+        checkAutoStartStreaming()
+    }
+
+    private fun checkAutoStartStreaming() {
+        if (autoStartSwitch.isChecked && !isStreaming) {
+            val cameraPermissionGranted = ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.CAMERA
+            ) == PackageManager.PERMISSION_GRANTED
+            if (cameraPermissionGranted) {
+                startStreamingService()
+            }
+        }
     }
 
     private fun requestPermissionsIfNeeded() {
@@ -110,6 +127,7 @@ class MainActivity : ComponentActivity() {
             multiplePermissionsResultLauncher.launch(permissionsToRequest.toTypedArray())
         } else {
             Log.d(TAG, "Camera and Notification permissions already granted")
+            checkAutoStartStreaming()
         }
     }
 
@@ -121,6 +139,14 @@ class MainActivity : ComponentActivity() {
         timestampSwitch.setOnCheckedChangeListener { _, isChecked ->
             handleTimestampSwitchChange(isChecked)
         }
+
+        autoStartSwitch.setOnCheckedChangeListener { _, isChecked ->
+            handleAutoStartSwitchChange(isChecked)
+        }
+    }
+
+    private fun handleAutoStartSwitchChange(isChecked: Boolean) {
+        sharedPreferences.edit { putBoolean(AUTO_START_STATE_KEY, isChecked) }
     }
 
     private fun handleStreamToggle(isChecked: Boolean) {

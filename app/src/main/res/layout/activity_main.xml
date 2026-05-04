@@ -50,6 +50,13 @@
             android:layout_marginBottom="8dp"
             android:text="Timestamp Overlay" />
 
+        <Switch
+            android:id="@+id/autoStartSwitch"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:checked="false"
+            android:text="Auto Start Streaming" />
+
     </LinearLayout>
 
     <View
