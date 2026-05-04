@@ -14,10 +14,10 @@ jobs: # Define the jobs to be executed in this workflow
 
     steps: # Define the steps within the 'build' job
       - name: Checkout code # Step name, descriptive
-        uses: actions/checkout@v4 # Action to checkout the repository code into the workflow environment
+        uses: actions/checkout@v6 # Action to checkout the repository code into the workflow environment
 
       - name: Set up JDK # Step name
-        uses: actions/setup-java@v4 # Action to set up Java environment
+        uses: actions/setup-java@v5 # Action to set up Java environment
         with:
           java-version: '17' # Specify Java version (adjust as needed for your project)
           distribution: 'temurin' # Distribution of Java to use (Temurin is a popular OpenJDK build)
@@ -38,7 +38,7 @@ jobs: # Define the jobs to be executed in this workflow
           SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
 
       - name: Upload APK # Step name
-        uses: actions/upload-artifact@v4 # Action to upload artifacts (files) from the workflow
+        uses: actions/upload-artifact@v7 # Action to upload artifacts (files) from the workflow
         with:
           name: release-apk # Name for the artifact
           path: app/build/outputs/apk/release/app-release.apk # Path to the generated APK file (adjust if your app's output path is different)
