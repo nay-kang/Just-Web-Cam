@@ -16,4 +16,6 @@ Effortlessly transform your device into a network-connected IP camera, allowing 
 
 **Feedback Welcome!** Please report any bugs, issues, or suggestions you have on our [GitHub issue tracker](https://github.com/nay-kang/Just-Web-Cam/issues).
 
+**Note:** For uninterrupted background streaming, configure your device's battery settings: [https://dontkillmyapp.com/](https://dontkillmyapp.com/)
+
 Thank you for helping us improve Just Web Cam!

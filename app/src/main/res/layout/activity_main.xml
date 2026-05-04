@@ -68,7 +68,8 @@
             android:layout_height="wrap_content"
             android:gravity="start"
             android:padding="8dp"
-            android:text="Please set app battery to unrestricted" />
+            android:autoLink="web"
+            android:text="Please set app battery to unrestricted. \nread more:https://dontkillmyapp.com/" />
 
     </TableRow>
 
