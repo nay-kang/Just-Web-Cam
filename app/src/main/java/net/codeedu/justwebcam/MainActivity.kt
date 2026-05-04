@@ -56,7 +56,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun initializeSharedPreferences() {
-        sharedPreferences = getSharedPreferences(PREF_FILE_KEY, Context.MODE_PRIVATE)
+        sharedPreferences = getSharedPreferences(PREF_FILE_KEY, MODE_PRIVATE)
         val savedTimestampState = sharedPreferences.getBoolean(TIMESTAMP_STATE_KEY, true)
         timestampSwitch.isChecked = savedTimestampState
     }
@@ -177,7 +177,7 @@ class MainActivity : ComponentActivity() {
 
     private fun getIPv4Address(): String? {
         val connectivityManager =
-            getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
         val network = connectivityManager.activeNetwork ?: return null
         val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return null
 

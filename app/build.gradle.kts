@@ -1,17 +1,16 @@
 plugins {
-    alias(libs.plugins.android.application)
-    alias(libs.plugins.kotlin.android)
-    alias(libs.plugins.kotlin.compose)
+    id("com.android.application")
+    id("org.jetbrains.kotlin.plugin.compose")
 }
 
 android {
     namespace = "net.codeedu.justwebcam"
-    compileSdk = 35
+    compileSdk = 37
 
     defaultConfig {
         applicationId = "net.codeedu.justwebcam"
         minSdk = 28
-        targetSdk = 35
+        targetSdk = 37
         versionCode = 3
         versionName = "0.0.3"
 
@@ -33,6 +32,7 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -41,15 +41,16 @@ android {
         }
     }
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_11
-        targetCompatibility = JavaVersion.VERSION_11
-    }
-    kotlinOptions {
-        jvmTarget = "11"
+        sourceCompatibility = JavaVersion.VERSION_21
+        targetCompatibility = JavaVersion.VERSION_21
     }
     buildFeatures {
         compose = true
     }
+}
+
+kotlin {
+    jvmToolchain(21)
 }
 
 dependencies {
