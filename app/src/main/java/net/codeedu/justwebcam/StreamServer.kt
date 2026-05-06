@@ -70,12 +70,14 @@ class StreamServer(
         serverScope.launch(Dispatchers.IO) { // Use serverScope for client handling coroutine
             val clientSocket = client // Create local variable for safe closing
             try {
+                clientSocket.tcpNoDelay = true
                 val input = BufferedReader(InputStreamReader(clientSocket.getInputStream()))
                 val output = clientSocket.getOutputStream()
 
                 // Read the request line to get the path
                 val requestLine = input.readLine()
-                val path = requestLine?.split(" ")?.getOrNull(1) ?: "/" // Default to root path
+                val rawPath = requestLine?.split(" ")?.getOrNull(1) ?: "/"
+                val path = rawPath.split("?").firstOrNull() ?: "/"
 
                 Log.d(TAG, "Request path: $path")
 

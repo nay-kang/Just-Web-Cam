@@ -82,9 +82,11 @@ class CameraStreamService : Service() {
         // Exposure time values (in nanoseconds)
         const val VERY_LONG_EXPOSURE_TIME_NS = 300_000_000L // 300ms (adjust as needed)
 
-        // FPS ranges
-        val DEFAULT_FPS_RANGE = Range(10, 15)// Default FPS range
-        const val FRAME_DURATION = 1_000_000_000L / 5 // 5 FPS
+        // Adaptive FPS ranges
+        val HIGH_FPS_RANGE = Range(25, 30) // Normal light: high FPS
+        val LOW_FPS_RANGE = Range(5, 10)    // Night mode: low FPS (prioritize exposure time)
+        const val LOW_FPS_FRAME_DURATION = 1_000_000_000L / 5 // 5 FPS for night mode
+
         val previewSize = Size(1280, 720)
 
         const val ACTION_UPDATE_TIMESTAMP_STATE =
@@ -292,24 +294,16 @@ class CameraStreamService : Service() {
 
     private fun processAndQueueFrame(image: Image) {
         frameCounter++
-        if (frameCounter % 15 == 0) { // Calculate brightness every 15 frames
+        if (frameCounter % 60 == 0) {
             frameCounter = 0
-
-            // Calculate average brightness on the smaller bitmap
             val averageBrightness = calculateAverageBrightnessOptimized(image)
-            Log.d(TAG, "Average Brightness: $averageBrightness")
-
-            // Determine light level category
             val currentLightLevel = when {
                 averageBrightness > NORMAL_LIGHT_THRESHOLD -> LightLevel.NORMAL
                 averageBrightness < DEEP_DARK_LIGHT_THRESHOLD -> LightLevel.DEEP_DARK
                 else -> LightLevel.KEEP
             }
-
-            // Update exposure if needed
             if (currentLightLevel != lastLightLevel && currentLightLevel != LightLevel.KEEP) {
                 lastLightLevel = currentLightLevel
-                Log.d(TAG, "Adjusting light level to: $currentLightLevel")
                 adjustExposure(currentLightLevel)
             }
         }
@@ -318,21 +312,16 @@ class CameraStreamService : Service() {
 
         if (showTimestampOverlay) {
             val canvas = Canvas(mutableBitmap)
-            var timestamp = timestampFormat.format(Date())
-            timestamp += " ${getBatteryPercentage()}%\uD83D\uDD0B"
-            val x = 20f
-            val y = 50f
-            canvas.drawText(timestamp, x, y, borderPaint)
-            canvas.drawText(timestamp, x, y, textPaint)
+            val timestamp = timestampFormat.format(Date())
+            val label = "$timestamp ${getBatteryPercentage()}%\uD83D\uDD0B"
+            canvas.drawText(label, 20f, 50f, borderPaint)
+            canvas.drawText(label, 20f, 50f, textPaint)
         }
 
-        jpegOutputStream.reset() // Reuse the stream
-        mutableBitmap.compress(
-            Bitmap.CompressFormat.JPEG,
-            50,
-            jpegOutputStream
-        ) // Final compression
-        val finalJpegBytes = jpegOutputStream.toByteArray() // Get bytes
+        jpegOutputStream.reset()
+        mutableBitmap.compress(Bitmap.CompressFormat.JPEG, 50, jpegOutputStream)
+        val finalJpegBytes = jpegOutputStream.toByteArray()
+
         mutableBitmap.recycle()
         frameQueue.offer(finalJpegBytes)
     }
@@ -431,7 +420,7 @@ class CameraStreamService : Service() {
                                     CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY
                                 )
                                 set(CaptureRequest.SENSOR_SENSITIVITY, isoRange?.upper ?: 800)
-                                set(CaptureRequest.SENSOR_FRAME_DURATION, FRAME_DURATION)
+                                set(CaptureRequest.SENSOR_FRAME_DURATION, LOW_FPS_FRAME_DURATION)
 
                             }
                 } else {
@@ -441,7 +430,7 @@ class CameraStreamService : Service() {
                                 addTarget(imageReader!!.surface)
                                 set(
                                     CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
-                                    DEFAULT_FPS_RANGE
+                                    HIGH_FPS_RANGE
                                 )
                             }
                 }
@@ -478,7 +467,7 @@ class CameraStreamService : Service() {
         val nv21 = ByteArray(ySize + uSize + vSize)
 
         yBuffer.get(nv21, 0, ySize)
-        vBuffer.get(nv21, ySize, vSize) // V before U for NV21
+        vBuffer.get(nv21, ySize, vSize)
         uBuffer.get(nv21, ySize + vSize, uSize)
 
         val yuvImage = android.graphics.YuvImage(
@@ -489,31 +478,23 @@ class CameraStreamService : Service() {
             null
         )
 
-        // Use a temporary BAOS for the intermediate JPEG
-        val intermediateJpegStream = ByteArrayOutputStream()
+        jpegOutputStream.reset()
         try {
             yuvImage.compressToJpeg(
                 android.graphics.Rect(0, 0, image.width, image.height),
-                90, // Intermediate quality - balance speed vs final quality
-                intermediateJpegStream
+                90,
+                jpegOutputStream
             )
-            val imageBytes = intermediateJpegStream.toByteArray()
+            val imageBytes = jpegOutputStream.toByteArray()
 
-            // Decode DIRECTLY to a mutable bitmap config if needed downstream
             val options = BitmapFactory.Options().apply {
                 inMutable = true
-                inPreferredConfig = Bitmap.Config.ARGB_8888 // Ensures mutable ARGB for Canvas
+                inPreferredConfig = Bitmap.Config.ARGB_8888
             }
-            val bitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size, options)
-            if (bitmap == null) {
-                Log.e(TAG, "Failed to decode intermediate JPEG")
-            }
-            return bitmap // Return the mutable bitmap
+            return BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size, options)
         } catch (e: Exception) {
             Log.e(TAG, "Error during YUV->Bitmap conversion", e)
             return null
-        } finally {
-            intermediateJpegStream.closeSafely() // Close the temp stream
         }
     }
 
@@ -585,7 +566,7 @@ class CameraStreamService : Service() {
                             addTarget(surface)
                             set(
                                 CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
-                                DEFAULT_FPS_RANGE
+                                HIGH_FPS_RANGE
                             )
                         }
                     session.setRepeatingRequest(
