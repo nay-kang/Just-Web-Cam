@@ -9,7 +9,6 @@ import android.app.Service
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.ImageFormat
@@ -45,6 +44,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
+import androidx.core.graphics.createBitmap
 
 class CameraStreamService : Service() {
     private lateinit var cameraId: String
@@ -67,6 +67,14 @@ class CameraStreamService : Service() {
     private val ISO_CHANGE_THRESHOLD = 50 // ISO threshold for logging changes
 
     private var showTimestampOverlay = true
+
+    // Cache components for efficient overlay
+    private var nv21Buffer: ByteArray? = null
+    private var timestampBitmap: Bitmap? = null
+    private var timestampCanvas: Canvas? = null
+    private var lastTimestampString: String? = null
+    private var cachedBattery = 0
+    private var lastBatteryUpdate = 0L
 
     // Reuse ByteArrayOutputStream
     private val jpegOutputStream = ByteArrayOutputStream()
@@ -293,23 +301,119 @@ class CameraStreamService : Service() {
         textAlign = Paint.Align.LEFT // Initialize alignment
     }
 
+    private fun getBatteryPercentageCached(): Int {
+        val now = System.currentTimeMillis()
+        if (now - lastBatteryUpdate > 10000) {
+            cachedBattery = getBatteryPercentage()
+            lastBatteryUpdate = now
+        }
+        return cachedBattery
+    }
+
     private fun processAndQueueFrame(image: Image) {
-        val mutableBitmap = imageToMutableBitmap(image) ?: return
+        val width = image.width
+        val height = image.height
+        val nv21 = imageToNv21(image)
 
         if (showTimestampOverlay) {
-            val canvas = Canvas(mutableBitmap)
             val timestamp = timestampFormat.format(Date())
-            val label = "$timestamp ${getBatteryPercentage()}%\uD83D\uDD0B"
-            canvas.drawText(label, 20f, 50f, borderPaint)
-            canvas.drawText(label, 20f, 50f, textPaint)
+            val battery = getBatteryPercentageCached()
+            val label = "$timestamp BAT: $battery%"
+            drawOverlayOnNv21(nv21, width, height, label)
         }
 
         jpegOutputStream.reset()
-        mutableBitmap.compress(Bitmap.CompressFormat.JPEG, 50, jpegOutputStream)
+        val yuvImage = android.graphics.YuvImage(nv21, ImageFormat.NV21, width, height, null)
+        yuvImage.compressToJpeg(android.graphics.Rect(0, 0, width, height), 50, jpegOutputStream)
         val finalJpegBytes = jpegOutputStream.toByteArray()
 
-        mutableBitmap.recycle()
         frameQueue.offer(finalJpegBytes)
+    }
+
+    private fun getNv21Buffer(width: Int, height: Int): ByteArray {
+        val size = width * height * 3 / 2
+        if (nv21Buffer == null || nv21Buffer!!.size != size) {
+            nv21Buffer = ByteArray(size)
+        }
+        return nv21Buffer!!
+    }
+
+    private fun imageToNv21(image: Image): ByteArray {
+        val width = image.width
+        val height = image.height
+        val nv21 = getNv21Buffer(width, height)
+
+        val yPlane = image.planes[0]
+        val uPlane = image.planes[1]
+        val vPlane = image.planes[2]
+
+        val yBuffer = yPlane.buffer
+        val uBuffer = uPlane.buffer
+        val vBuffer = vPlane.buffer
+
+        val yRowStride = yPlane.rowStride
+        val uvRowStride = uPlane.rowStride
+        val uvPixelStride = uPlane.pixelStride
+
+        // Copy Y plane
+        if (yRowStride == width) {
+            yBuffer.get(nv21, 0, width * height)
+        } else {
+            for (row in 0 until height) {
+                yBuffer.position(row * yRowStride)
+                yBuffer.get(nv21, row * width, width)
+            }
+        }
+
+        // Copy U/V plane (interleaved for NV21: V, U, V, U...)
+        var pos = width * height
+        for (row in 0 until height / 2) {
+            val rowOffset = row * uvRowStride
+            for (col in 0 until width / 2) {
+                nv21[pos++] = vBuffer.get(rowOffset + col * uvPixelStride)
+                nv21[pos++] = uBuffer.get(rowOffset + col * uvPixelStride)
+            }
+        }
+        return nv21
+    }
+
+    private fun drawOverlayOnNv21(nv21: ByteArray, width: Int, height: Int, label: String) {
+        if (lastTimestampString != label) {
+            lastTimestampString = label
+            if (timestampBitmap == null) {
+                timestampBitmap = createBitmap(550, 60)
+                timestampCanvas = Canvas(timestampBitmap!!)
+            }
+            timestampBitmap!!.eraseColor(Color.TRANSPARENT)
+            timestampCanvas!!.drawText(label, 10f, 45f, borderPaint)
+            timestampCanvas!!.drawText(label, 10f, 45f, textPaint)
+        }
+
+        val overlay = timestampBitmap!!
+        val ow = overlay.width
+        val oh = overlay.height
+        val pixels = IntArray(ow * oh)
+        overlay.getPixels(pixels, 0, ow, 0, 0, ow, oh)
+
+        val startX = 20
+        val startY = 20
+
+        for (i in 0 until oh) {
+            for (j in 0 until ow) {
+                val p = pixels[i * ow + j]
+                if ((p ushr 24) > 128) { // Only draw if alpha > 128
+                    val yIdx = (startY + i) * width + (startX + j)
+                    if (yIdx < width * height) {
+                        // Approximate Y (luminance) from RGB
+                        val r = (p shr 16) and 0xFF
+                        val g = (p shr 8) and 0xFF
+                        val b = p and 0xFF
+                        val y = (0.299 * r + 0.587 * g + 0.114 * b).toInt()
+                        nv21[yIdx] = y.toByte()
+                    }
+                }
+            }
+        }
     }
 
 
@@ -370,53 +474,6 @@ class CameraStreamService : Service() {
         exposureLogger.shutdown()
     }
 
-    private fun imageToMutableBitmap(image: Image): Bitmap? {
-        if (image.format != ImageFormat.YUV_420_888) {
-            Log.e(TAG, "Unexpected image format: ${image.format}")
-            return null
-        }
-        val planes = image.planes
-        val yBuffer = planes[0].buffer
-        val uBuffer = planes[1].buffer
-        val vBuffer = planes[2].buffer
-
-        val ySize = yBuffer.remaining()
-        val uSize = uBuffer.remaining()
-        val vSize = vBuffer.remaining()
-
-        val nv21 = ByteArray(ySize + uSize + vSize)
-
-        yBuffer.get(nv21, 0, ySize)
-        vBuffer.get(nv21, ySize, vSize)
-        uBuffer.get(nv21, ySize + vSize, uSize)
-
-        val yuvImage = android.graphics.YuvImage(
-            nv21,
-            ImageFormat.NV21,
-            image.width,
-            image.height,
-            null
-        )
-
-        jpegOutputStream.reset()
-        try {
-            yuvImage.compressToJpeg(
-                android.graphics.Rect(0, 0, image.width, image.height),
-                90,
-                jpegOutputStream
-            )
-            val imageBytes = jpegOutputStream.toByteArray()
-
-            val options = BitmapFactory.Options().apply {
-                inMutable = true
-                inPreferredConfig = Bitmap.Config.ARGB_8888
-            }
-            return BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size, options)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error during YUV->Bitmap conversion", e)
-            return null
-        }
-    }
 
     private val cameraStateCallback = object : CameraDevice.StateCallback() {
         override fun onOpened(camera: CameraDevice) {
