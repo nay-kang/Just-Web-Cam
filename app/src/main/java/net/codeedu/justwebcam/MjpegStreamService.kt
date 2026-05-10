@@ -17,42 +17,46 @@ import java.net.SocketException
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.atomic.AtomicInteger
 
-class StreamServer(
+/**
+ * MJPEG streaming service implementation
+ * Serves MJPEG streams over HTTP with a web interface
+ */
+class MjpegStreamService(
     private val frameQueue: LinkedBlockingQueue<ByteArray>,
-    private val clientCountCallback: (Int) -> Unit, // Callback function
-    private val context: Context, // Add Context as a parameter
+    private val clientCountCallback: (Int) -> Unit,
+    private val context: Context,
     private val port: Int
-) {
+) : StreamService {
+    
     private var serverSocket: ServerSocket? = null
-    private var serverJob: Job? = null // Job to manage the server coroutine
-    private val serverScope =
-        CoroutineScope(Dispatchers.IO + SupervisorJob()) // Scope for server coroutines
-    private val clientCounter = AtomicInteger(0) // Thread-safe client counter
+    private var serverJob: Job? = null
+    private val serverScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val clientCounter = AtomicInteger(0)
+    private var isRunning = false
 
-    fun start() {
+    override fun start() {
         if (serverJob?.isActive == true) {
-            Log.d(TAG, "Stream server already started") // Avoid starting multiple times
+            Log.d(TAG, "MJPEG stream server already started")
             return
         }
-        serverJob = serverScope.launch { // Use serverScope for coroutine
+        
+        serverJob = serverScope.launch {
             try {
                 serverSocket = ServerSocket(port)
-                Log.i(TAG, "Stream server started on port $port")
-                while (isActive) { // Check if the coroutine is still active
+                isRunning = true
+                Log.i(TAG, "MJPEG stream server started on port $port")
+                
+                while (isActive) {
                     try {
                         val client = serverSocket?.accept()
                         client?.let {
                             handleClient(it)
                         }
                     } catch (e: SocketException) {
-                        if (isActive) { // Only log if the exception wasn't due to server stop
-                            Log.w(
-                                TAG,
-                                "SocketException while accepting client (server might be stopping)",
-                                e
-                            )
+                        if (isActive) {
+                            Log.w(TAG, "SocketException while accepting client", e)
                         }
-                        break // Break out of the loop if server socket is closed
+                        break
                     } catch (e: IOException) {
                         Log.e(TAG, "IO Exception during client accept", e)
                     }
@@ -60,21 +64,37 @@ class StreamServer(
             } catch (e: IOException) {
                 Log.e(TAG, "Could not start server socket", e)
             } finally {
-                serverSocket?.closeSafely() // Ensure server socket is closed in finally block
-                Log.i(TAG, "Stream server stopped")
+                serverSocket?.closeSafely()
+                isRunning = false
+                Log.i(TAG, "MJPEG stream server stopped")
             }
         }
     }
 
-    private fun handleClient(client: Socket) {
-        serverScope.launch(Dispatchers.IO) { // Use serverScope for client handling coroutine
-            val clientSocket = client // Create local variable for safe closing
-            try {
-                clientSocket.tcpNoDelay = true
-                val input = BufferedReader(InputStreamReader(clientSocket.getInputStream()))
-                val output = clientSocket.getOutputStream()
+    override fun stop() {
+        Log.d(TAG, "Stopping MJPEG stream server...")
+        serverJob?.cancel()
+        serverSocket?.closeSafely()
+        serverSocket = null
+        serverJob = null
+        isRunning = false
+    }
 
-                // Read the request line to get the path
+    override fun isRunning(): Boolean = isRunning
+
+    override fun getStreamUrl(): String = "http://localhost:$port/video"
+
+    override fun getPort(): Int = port
+
+    override fun getProtocol(): String = StreamProtocol.MJPEG.displayName
+
+    private fun handleClient(client: Socket) {
+        serverScope.launch(Dispatchers.IO) {
+            try {
+                client.tcpNoDelay = true
+                val input = BufferedReader(InputStreamReader(client.getInputStream()))
+                val output = client.getOutputStream()
+
                 val requestLine = input.readLine()
                 val rawPath = requestLine?.split(" ")?.getOrNull(1) ?: "/"
                 val path = rawPath.split("?").firstOrNull() ?: "/"
@@ -83,33 +103,27 @@ class StreamServer(
 
                 when (path) {
                     "/" -> {
-                        // Serve HTML page from resource for root path
-                        val htmlResource = R.raw.stream_player // Reference to your HTML file
+                        val htmlResource = R.raw.stream_player
                         val inputStream = context.resources.openRawResource(htmlResource)
                         val htmlBytes = inputStream.readBytes()
                         inputStream.close()
 
                         output.write("HTTP/1.1 200 OK\r\n".toByteArray())
                         output.write("Content-Type: text/html\r\n\r\n".toByteArray())
-                        output.write(htmlBytes) // Send HTML from resource
+                        output.write(htmlBytes)
                         output.flush()
-                        Log.d(
-                            TAG,
-                            "HTML page from resource sent to client: ${clientSocket.inetAddress.hostAddress}"
-                        )
+                        Log.d(TAG, "HTML page sent to client: ${client.inetAddress.hostAddress}")
                     }
 
                     "/video" -> {
                         clientCounter.incrementAndGet()
-                        clientCountCallback(1) // ensure every time request camera successful
-                        // Serve MJPEG stream for /mjpeg_stream path
+                        clientCountCallback(clientCounter.get())
+                        
                         output.write("HTTP/1.1 200 OK\r\n".toByteArray())
                         output.write("Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n".toByteArray())
                         output.flush()
-                        Log.d(
-                            TAG,
-                            "MJPEG stream started for client: ${clientSocket.inetAddress.hostAddress}"
-                        )
+                        Log.d(TAG, "MJPEG stream started for client: ${client.inetAddress.hostAddress}")
+                        
                         while (isActive) {
                             try {
                                 val frame = frameQueue.take()
@@ -121,25 +135,20 @@ class StreamServer(
                                 output.flush()
                             } catch (e: InterruptedException) {
                                 if (isActive) {
-                                    Log.w(
-                                        TAG,
-                                        "InterruptedException while taking frame (client might be disconnecting)",
-                                        e
-                                    )
+                                    Log.w(TAG, "InterruptedException while taking frame", e)
                                 }
                                 break
                             } catch (e: IOException) {
-                                Log.e(TAG, "IO Exception during frame streaming to client", e)
+                                Log.e(TAG, "IO Exception during frame streaming", e)
                                 break
                             }
                         }
-                        val currentClientCount =
-                            clientCounter.decrementAndGet() // Decrement client count on disconnect
-                        clientCountCallback(currentClientCount) // Notify CameraStreamService
+                        
+                        val currentClientCount = clientCounter.decrementAndGet()
+                        clientCountCallback(currentClientCount)
                     }
 
                     else -> {
-                        // Handle unknown paths - send 404 Not Found
                         val notFoundResponse = "<html><body><h1>404 Not Found</h1></body></html>"
                         output.write("HTTP/1.1 404 Not Found\r\n".toByteArray())
                         output.write("Content-Type: text/html\r\n\r\n".toByteArray())
@@ -151,18 +160,10 @@ class StreamServer(
             } catch (e: Exception) {
                 Log.e(TAG, "Error handling client", e)
             } finally {
-                clientSocket.closeSafely() // Ensure client socket is closed in finally block
-                Log.d(TAG, "Client disconnected: ${clientSocket.inetAddress.hostAddress}")
+                client.closeSafely()
+                Log.d(TAG, "Client disconnected: ${client.inetAddress.hostAddress}")
             }
         }
-    }
-
-    fun stop() {
-        Log.d(TAG, "Stopping stream server...")
-        serverJob?.cancel() // Cancel the server coroutine
-        serverSocket?.closeSafely() // Close server socket
-        serverSocket = null
-        serverJob = null
     }
 
     private fun ServerSocket.closeSafely() {
@@ -182,6 +183,6 @@ class StreamServer(
     }
 
     companion object {
-        private const val TAG = "StreamServer" // Correct TAG definition in StreamServer
+        private const val TAG = "MjpegStreamService"
     }
 }

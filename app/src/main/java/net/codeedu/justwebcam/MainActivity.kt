@@ -1,7 +1,6 @@
 package net.codeedu.justwebcam
 
 import android.Manifest
-import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
@@ -10,6 +9,8 @@ import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
+import android.widget.RadioGroup
+import android.widget.RadioButton
 import android.widget.Switch
 import android.widget.TextView
 import android.widget.ToggleButton
@@ -29,6 +30,9 @@ class MainActivity : ComponentActivity() {
     private lateinit var ipAddressTextView: TextView
     private lateinit var timestampSwitch: Switch
     private lateinit var autoStartSwitch: Switch
+    private lateinit var protocolRadioGroup: RadioGroup
+    private lateinit var mjpegRadioButton: RadioButton
+    private lateinit var rtspRadioButton: RadioButton
     private lateinit var sharedPreferences: SharedPreferences
 
     // Use constants for keys
@@ -36,6 +40,7 @@ class MainActivity : ComponentActivity() {
         private const val TAG = "MainActivity"
         private const val TIMESTAMP_STATE_KEY = "timestamp_state"
         private const val AUTO_START_STATE_KEY = "auto_start_state"
+        private const val STREAM_PROTOCOL_KEY = "stream_protocol"
         private const val PREF_FILE_KEY = "main_activity_prefs"
     }
 
@@ -56,6 +61,9 @@ class MainActivity : ComponentActivity() {
         ipAddressTextView = findViewById(R.id.ipAddressTextView)
         timestampSwitch = findViewById(R.id.timestampSwitch)
         autoStartSwitch = findViewById(R.id.autoStartSwitch)
+        protocolRadioGroup = findViewById(R.id.protocolRadioGroup)
+        mjpegRadioButton = findViewById(R.id.mjpegRadioButton)
+        rtspRadioButton = findViewById(R.id.rtspRadioButton)
     }
 
     private fun initializeSharedPreferences() {
@@ -65,6 +73,18 @@ class MainActivity : ComponentActivity() {
 
         val savedAutoStartState = sharedPreferences.getBoolean(AUTO_START_STATE_KEY, false)
         autoStartSwitch.isChecked = savedAutoStartState
+
+        val savedProtocol = sharedPreferences.getString(STREAM_PROTOCOL_KEY, StreamProtocol.MJPEG.name)
+        val protocol = try {
+            StreamProtocol.valueOf(savedProtocol ?: StreamProtocol.MJPEG.name)
+        } catch (_: IllegalArgumentException) {
+            StreamProtocol.MJPEG
+        }
+        
+        when (protocol) {
+            StreamProtocol.MJPEG -> mjpegRadioButton.isChecked = true
+            StreamProtocol.RTSP -> rtspRadioButton.isChecked = true
+        }
     }
 
     private fun initializePermissionLauncher() {
@@ -77,6 +97,7 @@ class MainActivity : ComponentActivity() {
 
     private fun handlePermissionResult(permissions: Map<String, Boolean>) {
         val cameraPermissionGranted = permissions[Manifest.permission.CAMERA] ?: false
+        val audioPermissionGranted = permissions[Manifest.permission.RECORD_AUDIO] ?: false
         val notificationPermissionGranted =
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 permissions[Manifest.permission.POST_NOTIFICATIONS] ?: false
@@ -88,6 +109,12 @@ class MainActivity : ComponentActivity() {
             Log.d(TAG, "Camera permission granted")
         } else {
             Log.e(TAG, "Camera permission denied")
+        }
+        
+        if (audioPermissionGranted) {
+            Log.d(TAG, "Audio permission granted")
+        } else {
+            Log.e(TAG, "Audio permission denied")
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -107,14 +134,18 @@ class MainActivity : ComponentActivity() {
                 this,
                 Manifest.permission.CAMERA
             ) == PackageManager.PERMISSION_GRANTED
-            if (cameraPermissionGranted) {
+            val audioPermissionGranted = ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.RECORD_AUDIO
+            ) == PackageManager.PERMISSION_GRANTED
+            if (cameraPermissionGranted && audioPermissionGranted) {
                 startStreamingService()
             }
         }
     }
 
     private fun requestPermissionsIfNeeded() {
-        val permissionsToRequest = mutableListOf(Manifest.permission.CAMERA)
+        val permissionsToRequest = mutableListOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             permissionsToRequest.add(Manifest.permission.POST_NOTIFICATIONS)
         }
@@ -143,10 +174,30 @@ class MainActivity : ComponentActivity() {
         autoStartSwitch.setOnCheckedChangeListener { _, isChecked ->
             handleAutoStartSwitchChange(isChecked)
         }
+
+        protocolRadioGroup.setOnCheckedChangeListener { _, checkedId ->
+            handleProtocolChange(checkedId)
+        }
     }
 
     private fun handleAutoStartSwitchChange(isChecked: Boolean) {
         sharedPreferences.edit { putBoolean(AUTO_START_STATE_KEY, isChecked) }
+    }
+
+    private fun handleProtocolChange(checkedId: Int) {
+        val protocol = when (checkedId) {
+            R.id.mjpegRadioButton -> StreamProtocol.MJPEG
+            R.id.rtspRadioButton -> StreamProtocol.RTSP
+            else -> StreamProtocol.MJPEG
+        }
+        
+        sharedPreferences.edit { putString(STREAM_PROTOCOL_KEY, protocol.name) }
+        
+        if (isStreaming) {
+            sendProtocolChangeToService(protocol)
+        }
+        
+        updateUIState()
     }
 
     private fun handleStreamToggle(isChecked: Boolean) {
@@ -165,11 +216,16 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startStreamingService() {
-        if (ContextCompat.checkSelfPermission(
+        val cameraPermissionGranted = ContextCompat.checkSelfPermission(
                 this,
                 Manifest.permission.CAMERA
             ) == PackageManager.PERMISSION_GRANTED
-        ) {
+        val audioPermissionGranted = ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.RECORD_AUDIO
+            ) == PackageManager.PERMISSION_GRANTED
+        
+        if (cameraPermissionGranted && audioPermissionGranted) {
             Intent(this, CameraStreamService::class.java).apply {
                 action = CameraStreamService.ACTION_START_STREAM
                 putExtra(CameraStreamService.EXTRA_SHOW_TIMESTAMP, timestampSwitch.isChecked)
@@ -178,8 +234,13 @@ class MainActivity : ComponentActivity() {
             isStreaming = true
             updateUIState()
         } else {
-            Log.w(TAG, "Camera permission not granted, cannot start streaming")
-            multiplePermissionsResultLauncher.launch(arrayOf(Manifest.permission.CAMERA))
+            if (!cameraPermissionGranted) {
+                Log.w(TAG, "Camera permission not granted, cannot start streaming")
+            }
+            if (!audioPermissionGranted) {
+                Log.w(TAG, "Audio permission not granted, RTSP streaming may fail")
+            }
+            multiplePermissionsResultLauncher.launch(arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO))
         }
     }
 
@@ -193,12 +254,31 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun updateUIState() {
-        streamToggleButton.isEnabled = ContextCompat.checkSelfPermission(
+        val cameraPermissionGranted = ContextCompat.checkSelfPermission(
             this,
             Manifest.permission.CAMERA
         ) == PackageManager.PERMISSION_GRANTED
+        val audioPermissionGranted = ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.RECORD_AUDIO
+        ) == PackageManager.PERMISSION_GRANTED
+        
+        streamToggleButton.isEnabled = cameraPermissionGranted
         streamToggleButton.isChecked = isStreaming
-        ipAddressTextView.text = getString(R.string.http_address_label, getIPv4Address())
+        
+        val ipAddress = getIPv4Address()
+        val protocol = when (protocolRadioGroup.checkedRadioButtonId) {
+            R.id.mjpegRadioButton -> StreamProtocol.MJPEG
+            R.id.rtspRadioButton -> StreamProtocol.RTSP
+            else -> StreamProtocol.MJPEG
+        }
+        
+        val addressLabel = when (protocol) {
+            StreamProtocol.MJPEG -> getString(R.string.http_address_label, ipAddress)
+            StreamProtocol.RTSP -> getString(R.string.rtsp_address_label, ipAddress)
+        }
+        
+        ipAddressTextView.text = addressLabel
     }
 
     private fun getIPv4Address(): String? {
@@ -220,6 +300,14 @@ class MainActivity : ComponentActivity() {
         Intent(this, CameraStreamService::class.java).apply {
             action = CameraStreamService.ACTION_UPDATE_TIMESTAMP_STATE
             putExtra(CameraStreamService.EXTRA_SHOW_TIMESTAMP, showTimestamp)
+            startService(this)
+        }
+    }
+
+    private fun sendProtocolChangeToService(protocol: StreamProtocol) {
+        Intent(this, CameraStreamService::class.java).apply {
+            action = CameraStreamService.ACTION_CHANGE_PROTOCOL
+            putExtra(CameraStreamService.EXTRA_STREAM_PROTOCOL, protocol.name)
             startService(this)
         }
     }

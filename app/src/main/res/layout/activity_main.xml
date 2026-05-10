@@ -50,6 +50,38 @@
             android:layout_marginBottom="8dp"
             android:text="Timestamp Overlay" />
 
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="4dp"
+            android:text="Stream Protocol"
+            android:textSize="16sp"
+            android:textStyle="bold" />
+
+        <RadioGroup
+            android:id="@+id/protocolRadioGroup"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="8dp"
+            android:orientation="horizontal">
+
+            <RadioButton
+                android:id="@+id/mjpegRadioButton"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="MJPEG"
+                android:checked="true" />
+
+            <RadioButton
+                android:id="@+id/rtspRadioButton"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="RTSP" />
+
+        </RadioGroup>
+
         <Switch
             android:id="@+id/autoStartSwitch"
             android:layout_width="match_parent"
