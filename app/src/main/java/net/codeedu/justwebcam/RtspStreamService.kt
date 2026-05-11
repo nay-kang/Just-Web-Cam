@@ -1,12 +1,9 @@
 package net.codeedu.justwebcam
 
 import android.content.Context
-import android.media.AudioFormat
-import android.media.AudioRecord
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
-import android.media.MediaRecorder
 import android.util.Log
 import com.pedro.common.ConnectChecker
 import com.pedro.rtspserver.server.RtspServer
@@ -14,19 +11,24 @@ import com.pedro.rtspserver.server.RtspServer
 class RtspStreamService(
     private val context: Context,
     private val port: Int = 1935
-) : StreamService, FrameCallback, ConnectChecker {
+) : StreamService, FrameCallback, AudioCallback, ConnectChecker {
 
     private var rtspServer: RtspServer? = null
     private var videoCodec: MediaCodec? = null
     private var audioCodec: MediaCodec? = null
-    private var audioRecord: AudioRecord? = null
     private var isRunning = false
     private var serverStarted = false
     private var videoThread: Thread? = null
-    private var audioThread: Thread? = null
 
     @Volatile
     private var pendingFrame: ByteArray? = null
+    @Volatile
+    private var pendingAudio: ShortArray? = null
+    @Volatile
+    private var pendingAudioLength = 0
+    @Volatile
+    private var pendingAudioTimestampUs = 0L
+    
     private var i420Buffer: ByteArray? = null
     private val framePool = Array(2) { ByteArray(CameraStreamService.VIDEO_WIDTH * CameraStreamService.VIDEO_HEIGHT * 3 / 2) }
     private var poolIndex = 0
@@ -34,12 +36,10 @@ class RtspStreamService(
     companion object {
         private const val TAG = "RtspStreamService"
         private const val VIDEO_MIME = "video/avc"
-        private const val AUDIO_MIME = "audio/mp4a-latm"
         private const val VIDEO_BITRATE = 2_000_000
-        private const val AUDIO_BITRATE = 64_000
         private const val SAMPLE_RATE = 32000
-        private const val CHANNEL_COUNT = 1
         private const val I_FRAME_INTERVAL = 1
+        private const val AUDIO_MIME = "audio/mp4a-latm"
     }
 
     override fun start() {
@@ -65,132 +65,51 @@ class RtspStreamService(
             videoCodec!!.configure(videoFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             videoCodec!!.start()
 
-            startAudio()
+            // Initialize audio encoder (audio capture is in CameraStreamService)
+            val audioFormat = MediaFormat.createAudioFormat(AUDIO_MIME, SAMPLE_RATE, 1)
+            audioFormat.setInteger(MediaFormat.KEY_BIT_RATE, 64000)
+            audioFormat.setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
+
+            audioCodec = MediaCodec.createEncoderByType(AUDIO_MIME)
+            audioCodec!!.configure(audioFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            audioCodec!!.start()
+            Log.i(TAG, "RTSP audio encoder started")
 
             isRunning = true
             serverStarted = false
 
-            videoThread = Thread(::videoLoop, "RtspVideo")
+            videoThread = Thread(::videoAudioLoop, "RtspVideoAudio")
             videoThread!!.start()
 
-            Log.i(TAG, "RTSP video+audio encoder started")
+            Log.i(TAG, "RTSP video encoder started")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start RTSP", e)
-            stopAudio()
             cleanup()
             isRunning = false
         }
     }
 
-    private fun startAudio() {
-        try {
-            val minBuf = AudioRecord.getMinBufferSize(
-                SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO,
-                AudioFormat.ENCODING_PCM_16BIT
-            )
-            audioRecord = AudioRecord(
-                MediaRecorder.AudioSource.MIC,
-                SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO,
-                AudioFormat.ENCODING_PCM_16BIT,
-                minBuf.coerceAtLeast(2048)
-            )
-
-            val audioFormat = MediaFormat.createAudioFormat(AUDIO_MIME, SAMPLE_RATE, CHANNEL_COUNT)
-            audioFormat.setInteger(MediaFormat.KEY_BIT_RATE, AUDIO_BITRATE)
-            audioFormat.setInteger(
-                MediaFormat.KEY_AAC_PROFILE,
-                MediaCodecInfo.CodecProfileLevel.AACObjectLC
-            )
-            audioFormat.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, minBuf.coerceAtLeast(4096))
-
-            audioCodec = MediaCodec.createEncoderByType(AUDIO_MIME)
-            audioCodec!!.configure(audioFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-            audioCodec!!.start()
-
-            audioRecord!!.startRecording()
-
-            audioThread = Thread(::audioLoop, "RtspAudio")
-            audioThread!!.start()
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to start audio", e)
-            stopAudio()
-        }
-    }
-
-    private fun audioLoop() {
-        val record = audioRecord ?: return
-        val codec = audioCodec ?: return
-        val bufferInfo = MediaCodec.BufferInfo()
-        val pcmSize = AudioRecord.getMinBufferSize(
-            SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO,
-            AudioFormat.ENCODING_PCM_16BIT
-        ).coerceAtLeast(2048)
-        val pcmBuffer = ShortArray(pcmSize / 2)
-        var presentationTimeUs = System.nanoTime() / 1000
+    private fun videoAudioLoop() {
+        val videoCodec = videoCodec ?: return
+        val audioCodec = audioCodec ?: return
+        val videoBufferInfo = MediaCodec.BufferInfo()
+        val audioBufferInfo = MediaCodec.BufferInfo()
 
         while (isRunning) {
             try {
-                val read = record.read(pcmBuffer, 0, pcmBuffer.size)
-                if (read <= 0) continue
-
-                val inIndex = codec.dequeueInputBuffer(10000)
-                if (inIndex >= 0) {
-                    val inBuf = codec.getInputBuffer(inIndex)
-                    if (inBuf != null) {
-                        inBuf.clear()
-                        inBuf.order(java.nio.ByteOrder.nativeOrder())
-                        inBuf.asShortBuffer().put(pcmBuffer, 0, read)
-                        val byteLen = read * 2
-                        codec.queueInputBuffer(inIndex, 0, byteLen, presentationTimeUs, 0)
-                        presentationTimeUs += read * 1_000_000L / SAMPLE_RATE
-                    }
-                }
-
-                while (true) {
-                    val outIndex = codec.dequeueOutputBuffer(bufferInfo, 0)
-                    when {
-                        outIndex >= 0 -> {
-                            if (serverStarted && bufferInfo.size > 0) {
-                                val outBuf = codec.getOutputBuffer(outIndex)
-                                if (outBuf != null) {
-                                    outBuf.position(bufferInfo.offset)
-                                    outBuf.limit(bufferInfo.offset + bufferInfo.size)
-                                    rtspServer?.sendAudio(outBuf, bufferInfo)
-                                }
-                            }
-                            codec.releaseOutputBuffer(outIndex, false)
-                        }
-                        else -> break
-                    }
-                }
-            } catch (_: InterruptedException) {
-                break
-            } catch (e: Exception) {
-                if (isRunning) {
-                    Log.w(TAG, "Audio loop error", e)
-                }
-            }
-        }
-    }
-
-    private fun videoLoop() {
-        val codec = videoCodec ?: return
-        val bufferInfo = MediaCodec.BufferInfo()
-
-        while (isRunning) {
-            try {
+                // Process video frames
                 val frame = pendingFrame
                 if (frame != null) {
                     pendingFrame = null
-                    val inIndex = codec.dequeueInputBuffer(5000)
+                    val inIndex = videoCodec.dequeueInputBuffer(5000)
                     if (inIndex >= 0) {
-                        val inBuf = codec.getInputBuffer(inIndex)
+                        val inBuf = videoCodec.getInputBuffer(inIndex)
                         if (inBuf != null) {
                             val i420 = getI420Buffer(CameraStreamService.VIDEO_WIDTH, CameraStreamService.VIDEO_HEIGHT)
                             nv21ToI420(frame, i420, CameraStreamService.VIDEO_WIDTH, CameraStreamService.VIDEO_HEIGHT)
                             inBuf.clear()
                             inBuf.put(i420)
-                            codec.queueInputBuffer(
+                            videoCodec.queueInputBuffer(
                                 inIndex, 0, i420.size,
                                 System.nanoTime() / 1000, 0
                             )
@@ -198,26 +117,93 @@ class RtspStreamService(
                     }
                 }
 
-                var outIndex = codec.dequeueOutputBuffer(bufferInfo, 5000)
+                // Process audio from CameraStreamService
+                val audioBuffer = pendingAudio
+                if (audioBuffer != null && pendingAudioLength > 0) {
+                    val length = pendingAudioLength
+                    val timestampUs = pendingAudioTimestampUs
+
+                    val inIndex = audioCodec.dequeueInputBuffer(10000)
+                    if (inIndex >= 0) {
+                        val inBuf = audioCodec.getInputBuffer(inIndex)
+                        if (inBuf != null) {
+                            inBuf.clear()
+                            inBuf.order(java.nio.ByteOrder.nativeOrder())
+                            
+                            // Only process as much as the buffer can hold
+                            val maxShorts = inBuf.capacity() / 2
+                            val processLength = length.coerceAtMost(maxShorts)
+                            
+                            inBuf.asShortBuffer().put(audioBuffer, 0, processLength)
+                            val byteLen = processLength * 2
+                            audioCodec.queueInputBuffer(inIndex, 0, byteLen, timestampUs, 0)
+                            
+                            // Keep remaining data if buffer was too small
+                            if (processLength < length) {
+                                val remaining = ShortArray(length - processLength)
+                                System.arraycopy(audioBuffer, processLength, remaining, 0, remaining.size)
+                                pendingAudio = remaining
+                                pendingAudioLength = remaining.size
+                            } else {
+                                pendingAudio = null
+                                pendingAudioLength = 0
+                            }
+                        }
+                    }
+                }
+
+                // Process video output
+                var outIndex = videoCodec.dequeueOutputBuffer(videoBufferInfo, 0)
                 while (outIndex >= 0 || outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                     when {
                         outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                            handleVideoFormat(codec)
+                            handleVideoFormat(videoCodec)
                         }
                         outIndex >= 0 -> {
-                            handleVideoOutput(codec, outIndex, bufferInfo)
+                            handleVideoOutput(videoCodec, outIndex, videoBufferInfo)
                         }
                     }
-                    outIndex = codec.dequeueOutputBuffer(bufferInfo, 0)
+                    outIndex = videoCodec.dequeueOutputBuffer(videoBufferInfo, 0)
                 }
+
+                // Process audio output
+                var audioOutIndex = audioCodec.dequeueOutputBuffer(audioBufferInfo, 0)
+                while (audioOutIndex >= 0 || audioOutIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    when {
+                        audioOutIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                            // Audio format info received but not needed as config is set during init
+                        }
+                        audioOutIndex >= 0 -> {
+                            handleAudioOutput(audioCodec, audioOutIndex, audioBufferInfo)
+                        }
+                    }
+                    audioOutIndex = audioCodec.dequeueOutputBuffer(audioBufferInfo, 0)
+                }
+
+                Thread.yield()
             } catch (_: InterruptedException) {
                 break
             } catch (e: Exception) {
                 if (isRunning) {
-                    Log.w(TAG, "Video loop error", e)
+                    Log.w(TAG, "Video/Audio loop error", e)
                 }
             }
         }
+    }
+
+    private fun handleAudioOutput(codec: MediaCodec, index: Int, info: MediaCodec.BufferInfo) {
+        val server = rtspServer
+        if (server == null || !serverStarted) {
+            codec.releaseOutputBuffer(index, false)
+            return
+        }
+        val outBuf = codec.getOutputBuffer(index)
+        if (outBuf != null && info.size > 0) {
+            outBuf.position(info.offset)
+            outBuf.limit(info.offset + info.size)
+            server.sendAudio(outBuf, info)
+        }
+        codec.releaseOutputBuffer(index, false)
     }
 
     private fun handleVideoFormat(codec: MediaCodec) {
@@ -256,9 +242,7 @@ class RtspStreamService(
         Log.d(TAG, "Stopping RTSP server...")
         isRunning = false
         videoThread?.interrupt()
-        audioThread?.interrupt()
         try { videoThread?.join(2000) } catch (_: InterruptedException) {}
-        try { audioThread?.join(2000) } catch (_: InterruptedException) {}
 
         try {
             serverStarted = false
@@ -266,29 +250,24 @@ class RtspStreamService(
         } catch (e: Exception) {
             Log.e(TAG, "Error stopping RTSP server", e)
         }
-        stopAudio()
         cleanup()
         Log.i(TAG, "RTSP server stopped")
-    }
-
-    private fun stopAudio() {
-        try { audioRecord?.stop() } catch (_: Exception) {}
-        try { audioRecord?.release() } catch (_: Exception) {}
-        audioRecord = null
-        try { audioCodec?.stop() } catch (_: Exception) {}
-        try { audioCodec?.release() } catch (_: Exception) {}
-        audioCodec = null
     }
 
     private fun cleanup() {
         try { videoCodec?.stop() } catch (_: Exception) {}
         try { videoCodec?.release() } catch (_: Exception) {}
         videoCodec = null
+
+        try { audioCodec?.stop() } catch (_: Exception) {}
+        try { audioCodec?.release() } catch (_: Exception) {}
+        audioCodec = null
+
         rtspServer = null
         i420Buffer = null
         pendingFrame = null
+        pendingAudio = null
         videoThread = null
-        audioThread = null
     }
 
     override fun isRunning(): Boolean = isRunning
@@ -302,6 +281,17 @@ class RtspStreamService(
         poolIndex = (poolIndex + 1) % framePool.size
         System.arraycopy(nv21, 0, copy, 0, nv21.size)
         pendingFrame = copy
+    }
+
+    override fun onAudioData(buffer: ShortArray, length: Int, timestampUs: Long) {
+        if (!isRunning) return
+        
+        // Copy audio data to pending buffer for processing in videoAudioLoop
+        val copy = ShortArray(length)
+        System.arraycopy(buffer, 0, copy, 0, length)
+        pendingAudio = copy
+        pendingAudioLength = length
+        pendingAudioTimestampUs = timestampUs
     }
 
     private fun getI420Buffer(width: Int, height: Int): ByteArray {

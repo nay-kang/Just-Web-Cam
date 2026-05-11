@@ -67,6 +67,13 @@ interface FrameCallback {
 }
 
 /**
+ * Callback for delivering raw PCM audio data to stream services
+ */
+interface AudioCallback {
+    fun onAudioData(buffer: ShortArray, length: Int, timestampUs: Long)
+}
+
+/**
  * Enum for supported streaming protocols
  */
 enum class StreamProtocol(val displayName: String) {

@@ -23,8 +23,11 @@ import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
+import android.media.AudioFormat
+import android.media.AudioRecord
 import android.media.Image
 import android.media.ImageReader
+import android.media.MediaRecorder
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Handler
@@ -82,6 +85,14 @@ class CameraStreamService : Service() {
 
     // Frame callback for RTSP raw frame delivery
     private var frameCallback: FrameCallback? = null
+    
+    // Audio callback for RTSP audio delivery
+    private var audioCallback: AudioCallback? = null
+
+    // Audio capture (raw PCM)
+    private var audioRecord: AudioRecord? = null
+    private var audioThread: Thread? = null
+    private var isAudioRunning = false
 
     // Cache SimpleDateFormat
     private val timestampFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
@@ -101,12 +112,17 @@ class CameraStreamService : Service() {
         val FPS_RANGE = Range(5, TARGET_FPS) // Normal light: high FPS
 
         val previewSize = Size(VIDEO_WIDTH, VIDEO_HEIGHT)
+        
+        // Audio settings
+        const val AUDIO_SAMPLE_RATE = 32000
 
         const val ACTION_UPDATE_TIMESTAMP_STATE =
             "net.codeedu.justwebcam.ACTION_UPDATE_TIMESTAMP_STATE"
         const val EXTRA_SHOW_TIMESTAMP = "net.codeedu.justwebcam.EXTRA_SHOW_TIMESTAMP"
         const val ACTION_CHANGE_PROTOCOL = "net.codeedu.justwebcam.ACTION_CHANGE_PROTOCOL"
         const val EXTRA_STREAM_PROTOCOL = "net.codeedu.justwebcam.EXTRA_STREAM_PROTOCOL"
+        
+        
     }
 
     override fun onCreate() {
@@ -124,24 +140,7 @@ class CameraStreamService : Service() {
         }
         
         currentProtocol = protocol
-        streamService = when (protocol) {
-            StreamProtocol.MJPEG -> StreamServiceFactory.createMjpegStreamService(
-                frameQueue = frameQueue,
-                clientCountCallback = { clientCount ->
-                    onClientCountChanged(clientCount)
-                },
-                context = this,
-                8080
-            )
-            StreamProtocol.RTSP -> {
-                val svc = StreamServiceFactory.createRtspStreamService(
-                    context = this,
-                    1935
-                )
-                frameCallback = svc as FrameCallback
-                svc
-            }
-        }
+        streamService = createStreamService(protocol)
 
         Log.d(TAG, "Service onCreate")
     }
@@ -193,6 +192,7 @@ class CameraStreamService : Service() {
         getBatteryPercentageCached() // pre-warm battery cache before camera produces frames
 
         if (currentProtocol == StreamProtocol.RTSP) {
+            startAudio()
             startCamera()
         }
     }
@@ -212,23 +212,11 @@ class CameraStreamService : Service() {
         }
     }
 
-    private fun changeStreamProtocol(newProtocol: StreamProtocol) {
-        if (currentProtocol == newProtocol) {
-            Log.d(TAG, "Protocol already set to $newProtocol")
-            return
-        }
-
-        Log.i(TAG, "Changing stream protocol from $currentProtocol to $newProtocol")
-        
-        // Stop current stream
-        if (streamService.isRunning()) {
-            streamService.stop()
-        }
-        
-        // Create new stream service based on protocol
-        streamService = when (newProtocol) {
+    private fun createStreamService(protocol: StreamProtocol): StreamService {
+        return when (protocol) {
             StreamProtocol.MJPEG -> {
                 frameCallback = null
+                audioCallback = null
                 StreamServiceFactory.createMjpegStreamService(
                     frameQueue = frameQueue,
                     clientCountCallback = { clientCount ->
@@ -244,10 +232,26 @@ class CameraStreamService : Service() {
                     1935
                 )
                 frameCallback = svc as FrameCallback
+                audioCallback = svc as AudioCallback
                 svc
             }
         }
+    }
+
+    private fun changeStreamProtocol(newProtocol: StreamProtocol) {
+        if (currentProtocol == newProtocol) {
+            Log.d(TAG, "Protocol already set to $newProtocol")
+            return
+        }
+
+        Log.i(TAG, "Changing stream protocol from $currentProtocol to $newProtocol")
         
+        // Stop current stream
+        if (streamService.isRunning()) {
+            streamService.stop()
+        }
+        
+        streamService = createStreamService(newProtocol)
         currentProtocol = newProtocol
         
         // Start new stream service
@@ -260,9 +264,84 @@ class CameraStreamService : Service() {
         Log.i(TAG, "Stream protocol changed to $newProtocol. URL: ${streamService.getStreamUrl()}")
     }
 
+    private fun startAudio() {
+        if (ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.RECORD_AUDIO
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            Log.w(TAG, "RECORD_AUDIO permission not granted, audio will be disabled")
+            return
+        }
+
+        try {
+            val minBuf = AudioRecord.getMinBufferSize(
+                AUDIO_SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT
+            ).coerceAtLeast(2048)
+            audioRecord = AudioRecord(
+                MediaRecorder.AudioSource.MIC,
+                AUDIO_SAMPLE_RATE,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+                minBuf
+            )
+
+            audioRecord!!.startRecording()
+            isAudioRunning = true
+            audioThread = Thread(::audioLoop, "CameraAudio")
+            audioThread!!.start()
+
+            Log.i(TAG, "Audio capture started")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start audio", e)
+            stopAudio()
+        }
+    }
+
+    private fun stopAudio() {
+        isAudioRunning = false
+        audioThread?.interrupt()
+        try { audioThread?.join(2000) } catch (_: InterruptedException) {}
+
+        try { audioRecord?.stop() } catch (_: Exception) {}
+        try { audioRecord?.release() } catch (_: Exception) {}
+        audioRecord = null
+
+        audioThread = null
+        Log.d(TAG, "Audio capture stopped")
+    }
+
+    private fun audioLoop() {
+        val record = audioRecord ?: return
+        val pcmSize = AudioRecord.getMinBufferSize(
+            AUDIO_SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT
+        ).coerceAtLeast(2048)
+        val pcmBuffer = ShortArray(pcmSize / 2)
+        var presentationTimeUs = System.nanoTime() / 1000
+
+        while (isAudioRunning) {
+            try {
+                val read = record.read(pcmBuffer, 0, pcmBuffer.size)
+                if (read <= 0) continue
+
+                audioCallback?.onAudioData(pcmBuffer, read, presentationTimeUs)
+                presentationTimeUs += read * 1_000_000L / AUDIO_SAMPLE_RATE
+            } catch (_: InterruptedException) {
+                break
+            } catch (e: Exception) {
+                if (isAudioRunning) {
+                    Log.w(TAG, "Audio loop error", e)
+                }
+            }
+        }
+    }
+
     private fun stopCameraStreaming() {
         stopExposureLogging()
         streamService.stop()
+        stopAudio()
         stopCamera()
         Log.d(TAG, "Camera streaming stopped")
     }
