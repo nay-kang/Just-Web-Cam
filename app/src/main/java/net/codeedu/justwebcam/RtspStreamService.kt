@@ -6,12 +6,16 @@ import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.util.Log
 import com.pedro.common.ConnectChecker
+import com.pedro.rtspserver.server.ClientListener
 import com.pedro.rtspserver.server.RtspServer
+import com.pedro.rtspserver.server.ServerClient
+import java.util.concurrent.atomic.AtomicInteger
 
 class RtspStreamService(
     private val context: Context,
+    private val clientCountCallback: (Int) -> Unit,
     private val port: Int = 1935
-) : StreamService, FrameCallback, AudioCallback, ConnectChecker {
+) : StreamService, FrameCallback, AudioCallback, ConnectChecker, ClientListener {
 
     private var rtspServer: RtspServer? = null
     private var videoCodec: MediaCodec? = null
@@ -34,6 +38,9 @@ class RtspStreamService(
     private val framePool = Array(2) { ByteArray(CameraStreamService.VIDEO_WIDTH * CameraStreamService.VIDEO_HEIGHT * 3 / 2) }
     private var poolIndex = 0
 
+    private val clientCounter = AtomicInteger(0)
+    private var videoInfoSet = false
+
     companion object {
         private const val TAG = "RtspStreamService"
         private const val VIDEO_MIME = "video/avc"
@@ -50,7 +57,10 @@ class RtspStreamService(
         }
 
         runCatching {
-            rtspServer = RtspServer(this, port).apply { setAudioInfo(SAMPLE_RATE, false) }
+            rtspServer = RtspServer(this, port).apply {
+                setAudioInfo(SAMPLE_RATE, false)
+                setClientListener(this@RtspStreamService)
+            }
 
             // Video encoder setup
             val videoFormat = MediaFormat.createVideoFormat(VIDEO_MIME, CameraStreamService.VIDEO_WIDTH, CameraStreamService.VIDEO_HEIGHT).apply {
@@ -78,9 +88,10 @@ class RtspStreamService(
             Log.i(TAG, "RTSP audio encoder started")
 
             isRunning = true
-            serverStarted = false
+            serverStarted = true
+            rtspServer?.startServer()
             videoThread = Thread(::videoAudioLoop, "RtspVideoAudio").apply { start() }
-            Log.i(TAG, "RTSP video encoder started")
+            Log.i(TAG, "RTSP server started on port $port")
 
         }.onFailure { e ->
             Log.e(TAG, "Failed to start RTSP", e)
@@ -180,13 +191,15 @@ class RtspStreamService(
             val outFormat = codec.outputFormat
             val csd0 = outFormat.getByteBuffer("csd-0")
             val csd1 = outFormat.getByteBuffer("csd-1")
-            if (csd0 != null && csd1 != null && !serverStarted) {
+            if (csd0 != null && csd1 != null) {
                 rtspServer?.run {
                     resizeCache(2000)
                     setVideoInfo(csd0, csd1, null)
-                    startServer()
-                    serverStarted = true
-                    Log.i(TAG, "RTSP server started on port $port (video+audio)")
+                }
+                if (!videoInfoSet) {
+                    videoInfoSet = true
+                    Log.i(TAG, "RTSP video info set, server ready for connections")
+                    clientCountCallback(clientCounter.get())
                 }
             }
         }.onFailure { Log.e(TAG, "Failed to set video info", it) }
@@ -282,13 +295,13 @@ class RtspStreamService(
         Log.d(TAG, "Connection started: $url")
     }
     override fun onConnectionSuccess() {
-        Log.i(TAG, "Connection successful")
+        Log.d(TAG, "Connection successful")
     }
     override fun onConnectionFailed(reason: String) {
         Log.e(TAG, "Connection failed: $reason")
     }
     override fun onDisconnect() {
-        Log.i(TAG, "Disconnected")
+        Log.d(TAG, "Disconnected")
     }
     override fun onAuthError() {
         Log.e(TAG, "Auth error")
@@ -298,5 +311,23 @@ class RtspStreamService(
     }
     override fun onNewBitrate(bitrate: Long) {
         Log.d(TAG, "New bitrate: $bitrate")
+    }
+
+    override fun onClientConnected(client: ServerClient) {
+        Log.i(TAG, "Client connected: ${client.getAddress()}")
+        val count = clientCounter.incrementAndGet()
+        Log.d(TAG, "Clients total: $count")
+        clientCountCallback(count)
+    }
+
+    override fun onClientDisconnected(client: ServerClient) {
+        Log.i(TAG, "Client disconnected: ${client.getAddress()}")
+        val count = clientCounter.decrementAndGet()
+        Log.d(TAG, "Clients total: $count")
+        clientCountCallback(count)
+    }
+
+    override fun onClientNewBitrate(bitrate: Long, client: ServerClient) {
+        Log.d(TAG, "New bitrate: $bitrate for client ${client.getAddress()}")
     }
 }

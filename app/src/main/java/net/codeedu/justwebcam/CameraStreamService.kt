@@ -39,7 +39,6 @@ import android.util.Size
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import java.io.ByteArrayOutputStream
-import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -194,12 +193,19 @@ class CameraStreamService : Service() {
     }
 
     private fun onClientCountChanged(clientCount: Int) {
-        Log.d(TAG, "Client count changed: $clientCount")
-        if (currentProtocol != StreamProtocol.MJPEG) return
-        if (clientCount > 0) {
-            startCamera() // Start camera when first client connects
-        } else {
-            stopCamera()  // Stop camera when last client disconnects
+        Log.d(TAG, "Client count changed: $clientCount for protocol $currentProtocol")
+        cameraHandler.post {
+            if (clientCount > 0) {
+                if (currentProtocol == StreamProtocol.RTSP) {
+                    startAudio()
+                }
+                startCamera()
+            } else {
+                stopCamera()
+                if (currentProtocol == StreamProtocol.RTSP) {
+                    stopAudio()
+                }
+            }
         }
     }
 
@@ -216,7 +222,7 @@ class CameraStreamService : Service() {
                 )
             }
             StreamProtocol.RTSP -> {
-                val svc = StreamServiceFactory.createRtspStreamService(this, 1935)
+                val svc = StreamServiceFactory.createRtspStreamService(this, ::onClientCountChanged, 1935)
                 frameCallback = svc as FrameCallback
                 audioCallback = svc as AudioCallback
                 svc
@@ -236,11 +242,16 @@ class CameraStreamService : Service() {
             streamService.stop()
         }
         
+        // Stop camera/audio before switching protocol
+        stopCamera()
+        stopAudio()
+        
         streamService = createStreamService(newProtocol)
         currentProtocol = newProtocol
         streamService.start()
-        
+
         if (newProtocol == StreamProtocol.RTSP) {
+            startAudio()
             startCamera()
         }
         

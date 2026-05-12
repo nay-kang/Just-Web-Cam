@@ -53,9 +53,10 @@ object StreamServiceFactory {
     
     fun createRtspStreamService(
         context: Context,
+        clientCountCallback: (Int) -> Unit,
         port: Int = 1935
     ): StreamService {
-        return RtspStreamService(context, port)
+        return RtspStreamService(context, clientCountCallback, port)
     }
 }
 
