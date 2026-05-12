@@ -85,7 +85,7 @@ class CameraStreamService : Service() {
 
     // Frame callback for RTSP raw frame delivery
     private var frameCallback: FrameCallback? = null
-    
+
     // Audio callback for RTSP audio delivery
     private var audioCallback: AudioCallback? = null
 
@@ -109,10 +109,10 @@ class CameraStreamService : Service() {
         const val TARGET_FPS = 30
 
         // Adaptive FPS ranges
-        val FPS_RANGE = Range(5, TARGET_FPS) // Normal light: high FPS
+        val FPS_RANGE = Range(5, TARGET_FPS)
 
         val previewSize = Size(VIDEO_WIDTH, VIDEO_HEIGHT)
-        
+
         // Audio settings
         const val AUDIO_SAMPLE_RATE = 32000
 
@@ -121,8 +121,6 @@ class CameraStreamService : Service() {
         const val EXTRA_SHOW_TIMESTAMP = "net.codeedu.justwebcam.EXTRA_SHOW_TIMESTAMP"
         const val ACTION_CHANGE_PROTOCOL = "net.codeedu.justwebcam.ACTION_CHANGE_PROTOCOL"
         const val EXTRA_STREAM_PROTOCOL = "net.codeedu.justwebcam.EXTRA_STREAM_PROTOCOL"
-        
-        
     }
 
     override fun onCreate() {
@@ -130,18 +128,16 @@ class CameraStreamService : Service() {
         cameraHandler = Handler(cameraThread.looper)
         exposureLogger = Executors.newSingleThreadScheduledExecutor()
         captureCallback = createCaptureCallback()
+        cameraManager = getSystemService(CAMERA_SERVICE) as CameraManager
         // Initialize stream service based on saved protocol preference
         val sharedPreferences = getSharedPreferences("main_activity_prefs", MODE_PRIVATE)
         val savedProtocol = sharedPreferences.getString("stream_protocol", StreamProtocol.MJPEG.name)
-        val protocol = try {
+        currentProtocol = try {
             StreamProtocol.valueOf(savedProtocol ?: StreamProtocol.MJPEG.name)
         } catch (_: IllegalArgumentException) {
             StreamProtocol.MJPEG
         }
-        
-        currentProtocol = protocol
-        streamService = createStreamService(protocol)
-
+        streamService = createStreamService(currentProtocol)
         Log.d(TAG, "Service onCreate")
     }
 
@@ -149,23 +145,20 @@ class CameraStreamService : Service() {
         Log.d(TAG, "Service onStartCommand: ${intent?.action}")
         when (intent?.action) {
             ACTION_START_STREAM -> {
-                startForegroundService() // Start as foreground service
+                startForegroundService()
                 showTimestampOverlay = intent.getBooleanExtra(EXTRA_SHOW_TIMESTAMP, true)
                 startExposureLogging()
                 streamService.start()
             }
-
             ACTION_STOP_STREAM -> {
                 stopCameraStreaming()
                 stopForegroundService() // Stop foreground service and service itself
                 stopSelf() // Stop the service
             }
-
             ACTION_UPDATE_TIMESTAMP_STATE -> {
                 showTimestampOverlay = intent.getBooleanExtra(EXTRA_SHOW_TIMESTAMP, true)
                 Log.d(TAG, "Timestamp overlay state updated to: $showTimestampOverlay")
             }
-
             ACTION_CHANGE_PROTOCOL -> {
                 val protocolName = intent.getStringExtra(EXTRA_STREAM_PROTOCOL)
                 val newProtocol = try {
@@ -176,7 +169,6 @@ class CameraStreamService : Service() {
                 }
                 changeStreamProtocol(newProtocol)
             }
-
             else -> Log.w(TAG, "Unknown action: ${intent?.action}")
         }
         return START_STICKY // Or START_NOT_STICKY, depending on your needs
@@ -184,9 +176,8 @@ class CameraStreamService : Service() {
 
     private fun startForegroundService() {
         createNotificationChannel()
-        val notification: Notification =
-            createNotification("Streaming video in background")
-        startForeground(1, notification) // Start foreground service with notification
+        val notification = createNotification("Streaming video in background")
+        startForeground(1, notification)
         Log.d(TAG, "Foreground service started")
 
         getBatteryPercentageCached() // pre-warm battery cache before camera produces frames
@@ -219,18 +210,13 @@ class CameraStreamService : Service() {
                 audioCallback = null
                 StreamServiceFactory.createMjpegStreamService(
                     frameQueue = frameQueue,
-                    clientCountCallback = { clientCount ->
-                        onClientCountChanged(clientCount)
-                    },
+                    clientCountCallback = ::onClientCountChanged,
                     context = this,
                     8080
                 )
             }
             StreamProtocol.RTSP -> {
-                val svc = StreamServiceFactory.createRtspStreamService(
-                    context = this,
-                    1935
-                )
+                val svc = StreamServiceFactory.createRtspStreamService(this, 1935)
                 frameCallback = svc as FrameCallback
                 audioCallback = svc as AudioCallback
                 svc
@@ -246,15 +232,12 @@ class CameraStreamService : Service() {
 
         Log.i(TAG, "Changing stream protocol from $currentProtocol to $newProtocol")
         
-        // Stop current stream
         if (streamService.isRunning()) {
             streamService.stop()
         }
         
         streamService = createStreamService(newProtocol)
         currentProtocol = newProtocol
-        
-        // Start new stream service
         streamService.start()
         
         if (newProtocol == StreamProtocol.RTSP) {
@@ -265,35 +248,32 @@ class CameraStreamService : Service() {
     }
 
     private fun startAudio() {
-        if (ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.RECORD_AUDIO
-            ) != PackageManager.PERMISSION_GRANTED
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) 
+            != PackageManager.PERMISSION_GRANTED
         ) {
             Log.w(TAG, "RECORD_AUDIO permission not granted, audio will be disabled")
             return
         }
 
-        try {
+        runCatching {
             val minBuf = AudioRecord.getMinBufferSize(
                 AUDIO_SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT
             ).coerceAtLeast(2048)
+            
             audioRecord = AudioRecord(
                 MediaRecorder.AudioSource.MIC,
                 AUDIO_SAMPLE_RATE,
                 AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT,
                 minBuf
-            )
-
-            audioRecord!!.startRecording()
+            ).apply { startRecording() }
+            
             isAudioRunning = true
-            audioThread = Thread(::audioLoop, "CameraAudio")
-            audioThread!!.start()
-
+            audioThread = Thread(::audioLoop, "CameraAudio").apply { start() }
             Log.i(TAG, "Audio capture started")
-        } catch (e: Exception) {
+            
+        }.onFailure { e ->
             Log.e(TAG, "Failed to start audio", e)
             stopAudio()
         }
@@ -302,12 +282,10 @@ class CameraStreamService : Service() {
     private fun stopAudio() {
         isAudioRunning = false
         audioThread?.interrupt()
-        try { audioThread?.join(2000) } catch (_: InterruptedException) {}
+        runCatching { audioThread?.join(2000) }
 
-        try { audioRecord?.stop() } catch (_: Exception) {}
-        try { audioRecord?.release() } catch (_: Exception) {}
+        audioRecord?.safeStopRelease()
         audioRecord = null
-
         audioThread = null
         Log.d(TAG, "Audio capture stopped")
     }
@@ -331,9 +309,7 @@ class CameraStreamService : Service() {
             } catch (_: InterruptedException) {
                 break
             } catch (e: Exception) {
-                if (isAudioRunning) {
-                    Log.w(TAG, "Audio loop error", e)
-                }
+                if (isAudioRunning) Log.w(TAG, "Audio loop error", e)
             }
         }
     }
@@ -348,20 +324,16 @@ class CameraStreamService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
-        stopExposureLogging()
-        stopCameraStreaming() // Ensure everything is stopped on destroy
+        stopCameraStreaming()
+        
         cameraThread.quitSafely()
-        try {
-            cameraThread.join()
-        } catch (e: InterruptedException) {
-            Log.e(TAG, "Interrupted while waiting for camera thread to join", e)
+        runCatching { cameraThread.join() }.onFailure { e ->
+            Log.e(TAG, "Interrupted while waiting for camera thread", e)
             Thread.currentThread().interrupt()
         }
 
         imageProcessingThread.quitSafely()
-        try {
-            imageProcessingThread.join()
-        } catch (_: InterruptedException) {
+        runCatching { imageProcessingThread.join() }.onFailure {
             Thread.currentThread().interrupt()
         }
         Log.d(TAG, "Service onDestroy")
@@ -386,56 +358,48 @@ class CameraStreamService : Service() {
     }*/
 
     private fun startCamera() {
-        if (cameraDevice != null) { // Check if camera is already open
-            Log.d(TAG, "Camera already started, not restarting.")
+        if (cameraDevice != null) {
+            Log.d(TAG, "Camera already started")
             return
         }
-        if (ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.CAMERA
-            ) == PackageManager.PERMISSION_GRANTED
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) 
+            == PackageManager.PERMISSION_GRANTED
         ) {
             setupCamera()
         } else {
-            Log.w(TAG, "Camera permission not granted, cannot start camera")
-            // TODO inform the Activity.
+            Log.w(TAG, "Camera permission not granted")
         }
     }
 
     private fun stopCamera() {
-        captureSession?.closeSafely()
+        captureSession?.safeClose()
         captureSession = null
-        cameraDevice?.closeSafely()
+        cameraDevice?.safeClose()
         cameraDevice = null
-        imageReader?.closeSafely()
+        imageReader?.safeClose()
         imageReader = null
     }
 
     private fun setupCamera() {
-        cameraManager = getSystemService(CAMERA_SERVICE) as CameraManager
         try {
-            val cameraIds = cameraManager.cameraIdList
-            cameraId = cameraIds.firstOrNull { id ->
-                val characteristics = cameraManager.getCameraCharacteristics(id)
-                characteristics.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
+            cameraId = cameraManager.cameraIdList.firstOrNull { id ->
+                cameraManager.getCameraCharacteristics(id)
+                    .get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
             } ?: throw IllegalStateException("Back camera not found")
 
             imageReader = ImageReader.newInstance(
-                previewSize.width,
-                previewSize.height,
-                ImageFormat.YUV_420_888,
-                5
+                previewSize.width, previewSize.height,
+                ImageFormat.YUV_420_888, 5
             ).apply {
                 setOnImageAvailableListener({ reader ->
-                    try {
-                        val image = reader.acquireLatestImage()
-                        image?.let { img ->
+                    runCatching {
+                        reader.acquireLatestImage()?.let { img ->
                             imageProcessingHandler.post {
                                 processAndQueueFrame(img)
                                 img.close()
                             }
                         }
-                    } catch (e: IllegalStateException) {
+                    }.onFailure { e ->
                         Log.e(TAG, "ImageReader buffer full", e)
                     }
                 }, cameraHandler)
@@ -452,7 +416,6 @@ class CameraStreamService : Service() {
         } catch (e: IllegalStateException) {
             Log.e(TAG, "Illegal State Exception: ${e.message}", e)
         }
-
     }
 
     private fun getBatteryPercentage(): Int {
@@ -465,15 +428,16 @@ class CameraStreamService : Service() {
         textSize = 40f
         isAntiAlias = true
         style = Paint.Style.FILL
-        textAlign = Paint.Align.LEFT // Initialize alignment
+        textAlign = Paint.Align.LEFT
     }
+    
     private val borderPaint = Paint().apply {
         color = Color.BLACK
         textSize = 40f
         isAntiAlias = true
         style = Paint.Style.STROKE
         strokeWidth = 5f
-        textAlign = Paint.Align.LEFT // Initialize alignment
+        textAlign = Paint.Align.LEFT
     }
 
     private fun getBatteryPercentageCached(): Int {
@@ -493,18 +457,16 @@ class CameraStreamService : Service() {
         if (showTimestampOverlay) {
             val timestamp = timestampFormat.format(Date())
             val battery = getBatteryPercentageCached()
-            val label = "$timestamp BAT: $battery%"
-            drawOverlayOnNv21(nv21, width, height, label)
+            drawOverlayOnNv21(nv21, width, height, "$timestamp BAT: $battery%")
         }
 
         frameCallback?.onNv21Frame(nv21, width, height, System.nanoTime() / 1000)
 
         if (currentProtocol == StreamProtocol.MJPEG) {
             jpegOutputStream.reset()
-            val yuvImage = android.graphics.YuvImage(nv21, ImageFormat.NV21, width, height, null)
-            yuvImage.compressToJpeg(android.graphics.Rect(0, 0, width, height), 50, jpegOutputStream)
-            val finalJpegBytes = jpegOutputStream.toByteArray()
-            frameQueue.offer(finalJpegBytes)
+            android.graphics.YuvImage(nv21, ImageFormat.NV21, width, height, null)
+                .compressToJpeg(android.graphics.Rect(0, 0, width, height), 50, jpegOutputStream)
+            frameQueue.offer(jpegOutputStream.toByteArray())
         }
     }
 
@@ -533,7 +495,6 @@ class CameraStreamService : Service() {
         val uvRowStride = uPlane.rowStride
         val uvPixelStride = uPlane.pixelStride
 
-        // Copy Y plane
         if (yRowStride == width) {
             yBuffer.get(nv21, 0, width * height)
         } else {
@@ -543,7 +504,6 @@ class CameraStreamService : Service() {
             }
         }
 
-        // Copy U/V plane (interleaved for NV21: V, U, V, U...)
         var pos = width * height
         for (row in 0 until height / 2) {
             val rowOffset = row * uvRowStride
@@ -568,80 +528,65 @@ class CameraStreamService : Service() {
         }
 
         val overlay = timestampBitmap!!
-        val ow = overlay.width
-        val oh = overlay.height
-        val pixels = IntArray(ow * oh)
-        overlay.getPixels(pixels, 0, ow, 0, 0, ow, oh)
+        val pixels = IntArray(overlay.width * overlay.height)
+        overlay.getPixels(pixels, 0, overlay.width, 0, 0, overlay.width, overlay.height)
 
-        val startX = 20
-        val startY = 20
-
-        for (i in 0 until oh) {
-            for (j in 0 until ow) {
-                val p = pixels[i * ow + j]
-                if ((p ushr 24) > 128) { // Only draw if alpha > 128
-                    val yIdx = (startY + i) * width + (startX + j)
+        for (i in 0 until overlay.height) {
+            for (j in 0 until overlay.width) {
+                val p = pixels[i * overlay.width + j]
+                if ((p ushr 24) > 128) {
+                    val yIdx = (20 + i) * width + (20 + j)
                     if (yIdx < width * height) {
-                        // Approximate Y (luminance) from RGB
                         val r = (p shr 16) and 0xFF
                         val g = (p shr 8) and 0xFF
                         val b = p and 0xFF
-                        val y = (0.299 * r + 0.587 * g + 0.114 * b).toInt()
-                        nv21[yIdx] = y.toByte()
+                        nv21[yIdx] = (0.299 * r + 0.587 * g + 0.114 * b).toInt().toByte()
                     }
                 }
             }
         }
     }
 
-
     private fun startExposureLogging() {
-        exposureLogger.scheduleWithFixedDelay({
-            logCurrentExposureSettings()
-        }, 0, 10, TimeUnit.SECONDS)
+        exposureLogger.scheduleWithFixedDelay({ logCurrentExposureSettings() }, 0, 10, TimeUnit.SECONDS)
     }
 
     private fun logCurrentExposureSettings() {
-        // Log the last captured exposure values
         Log.d(TAG, "Last captured exposure - Time: ${lastLoggedExposureTime ?: "N/A"} ns, ISO: ${lastLoggedIso ?: "N/A"}")
         
-        // Also log ranges for reference
-        try {
+        runCatching {
             val cameraCharacteristics = cameraManager.getCameraCharacteristics(cameraId)
             val exposureTimeRange = cameraCharacteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
             val isoRange = cameraCharacteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
             
-            Log.d(TAG, "Available Ranges - Exposure: ${exposureTimeRange?.lower?.toString() ?: "N/A"}-${exposureTimeRange?.upper?.toString() ?: "N/A"} ns, ISO: ${isoRange?.lower?.toString() ?: "N/A"}-${isoRange?.upper?.toString() ?: "N/A"}")
-        } catch (e: CameraAccessException) {
+            Log.d(TAG, "Available Ranges - Exposure: ${exposureTimeRange?.lower}-${exposureTimeRange?.upper} ns, ISO: ${isoRange?.lower}-${isoRange?.upper}")
+        }.onFailure { e ->
             Log.e(TAG, "Failed to get camera characteristics", e)
         }
     }
 
     private fun createCaptureCallback(): CameraCaptureSession.CaptureCallback {
         return object : CameraCaptureSession.CaptureCallback() {
-            override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: android.hardware.camera2.TotalCaptureResult) {
+            override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, 
+                result: android.hardware.camera2.TotalCaptureResult) {
                 super.onCaptureCompleted(session, request, result)
                 
-                // Get the actual exposure values from the capture result
                 val exposureTime = result.get(CaptureResult.SENSOR_EXPOSURE_TIME)
                 val iso = result.get(CaptureResult.SENSOR_SENSITIVITY)
-                val aeMode = result.get(CaptureResult.CONTROL_AE_MODE)
                 
-                // Update the last known values
                 lastLoggedExposureTime = exposureTime
                 lastLoggedIso = iso
                 
-                // Log when values change significantly or every 10 seconds
                 val currentTime = System.currentTimeMillis()
-                val shouldLog = currentTime - lastLogTime > 10000 // Force log every 10 seconds
-                
+                val shouldLog = currentTime - lastLogTime > 10000
                 val exposureChanged = lastLoggedExposureTime != null && exposureTime != null && 
                     kotlin.math.abs(exposureTime - lastLoggedExposureTime!!) > EXPOSURE_CHANGE_THRESHOLD_NS
                 val isoChanged = lastLoggedIso != null && iso != null && 
                     kotlin.math.abs(iso - lastLoggedIso!!) > ISO_CHANGE_THRESHOLD
                 
                 if (shouldLog || exposureChanged || isoChanged) {
-                    Log.d(TAG, "AE Mode: $aeMode, Exposure: ${exposureTime}ns (${exposureTime?.let { it/1_000_000 } ?: "N/A"}ms), ISO: $iso")
+                    Log.d(TAG, "AE Mode: ${result.get(CaptureResult.CONTROL_AE_MODE)}, " +
+                        "Exposure: ${exposureTime}ns (${exposureTime?.div(1_000_000)}ms), ISO: $iso")
                     lastLogTime = currentTime
                 }
             }
@@ -651,7 +596,6 @@ class CameraStreamService : Service() {
     private fun stopExposureLogging() {
         exposureLogger.shutdown()
     }
-
 
     private val cameraStateCallback = object : CameraDevice.StateCallback() {
         override fun onOpened(camera: CameraDevice) {
@@ -683,10 +627,8 @@ class CameraStreamService : Service() {
     private fun createCaptureSession() {
         cameraDevice?.let { device ->
             imageReader?.let { reader ->
-                try {
-                    val outputConfigurations = listOf(
-                        OutputConfiguration(reader.surface)
-                    )
+                runCatching {
+                    val outputConfigurations = listOf(OutputConfiguration(reader.surface))
                     val sessionConfiguration = SessionConfiguration(
                         SessionConfiguration.SESSION_REGULAR,
                         outputConfigurations,
@@ -703,8 +645,7 @@ class CameraStreamService : Service() {
                         }
                     )
                     device.createCaptureSession(sessionConfiguration)
-
-                } catch (e: CameraAccessException) {
+                }.onFailure { e ->
                     Log.e(TAG, "Capture session creation exception", e)
                 }
             } ?: Log.e(TAG, "ImageReader not initialized")
@@ -714,47 +655,28 @@ class CameraStreamService : Service() {
     private fun startCaptureSession() {
         captureSession?.let { session ->
             imageReader?.surface?.let { surface ->
-                try {
+                runCatching {
+                    val requestBuilder = session.device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                        addTarget(surface)
+                        set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, FPS_RANGE)
 
-                    val requestBuilder =
-                        session.device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
-                            addTarget(surface)
-                            set(
-                                CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
-                                FPS_RANGE
-                            )
-
-                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
-                                set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON_LOW_LIGHT_BOOST_BRIGHTNESS_PRIORITY)
-                            }
-                            set(
-                                CaptureRequest.CONTROL_MODE,
-                                CaptureRequest.CONTROL_MODE_USE_SCENE_MODE
-                            )
-                            set(
-                                CaptureRequest.CONTROL_SCENE_MODE,
-                                CaptureRequest.CONTROL_SCENE_MODE_NIGHT
-                            )
-                            set(
-                                CaptureRequest.NOISE_REDUCTION_MODE,
-                                CaptureRequest.NOISE_REDUCTION_MODE_FAST
-                            )
-                            set(
-                                CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
-                                CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON
-                            )
-                            val compensationRange = cameraManager.getCameraCharacteristics(cameraId)
-                                .get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)
-                            if (compensationRange != null && compensationRange.upper >= 1) {
-                                set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, minOf(1, compensationRange.upper))
-                            }
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
+                            set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON_LOW_LIGHT_BOOST_BRIGHTNESS_PRIORITY)
                         }
-                    session.setRepeatingRequest(
-                        requestBuilder.build(),
-                        captureCallback,
-                        cameraHandler
-                    )
-                } catch (e: CameraAccessException) {
+                        set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_USE_SCENE_MODE)
+                        set(CaptureRequest.CONTROL_SCENE_MODE, CaptureRequest.CONTROL_SCENE_MODE_NIGHT)
+                        set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_FAST)
+                        set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON)
+                        
+                        cameraManager.getCameraCharacteristics(cameraId)
+                            .get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)?.let { range ->
+                                if (range.upper >= 1) {
+                                    set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, minOf(1, range.upper))
+                                }
+                            }
+                    }
+                    session.setRepeatingRequest(requestBuilder.build(), captureCallback, cameraHandler)
+                }.onFailure { e ->
                     Log.e(TAG, "Repeating capture request exception", e)
                 }
             } ?: Log.e(TAG, "ImageReader surface is null")
@@ -765,75 +687,46 @@ class CameraStreamService : Service() {
         val serviceChannel = NotificationChannel(
             NOTIFICATION_CHANNEL_ID,
             "Camera Stream Service Channel",
-            NotificationManager.IMPORTANCE_LOW // or IMPORTANCE_LOW for less intrusive
+            NotificationManager.IMPORTANCE_LOW
         )
-        val manager = getSystemService(NotificationManager::class.java)
-        manager.createNotificationChannel(serviceChannel)
+        getSystemService(NotificationManager::class.java).createNotificationChannel(serviceChannel)
     }
 
     private fun createNotification(message: String): Notification {
-        val notificationIntent =
-            Intent(this, MainActivity::class.java) // Open MainActivity if notification tapped
-        val pendingIntent = PendingIntent.getActivity(
-            this, 0, notificationIntent,
-            PendingIntent.FLAG_IMMUTABLE // Recommended flag for pending intents
-        )
+        val notificationIntent = Intent(this, MainActivity::class.java)
+        val pendingIntent = PendingIntent.getActivity(this, 0, notificationIntent, PendingIntent.FLAG_IMMUTABLE)
 
         val stopIntent = Intent(this, CameraStreamService::class.java).apply {
-            action = ACTION_STOP_STREAM // Action to stop the service
+            action = ACTION_STOP_STREAM
         }
-        val stopPendingIntent: PendingIntent =
-            PendingIntent.getService(this, 0, stopIntent, PendingIntent.FLAG_IMMUTABLE)
+        val stopPendingIntent = PendingIntent.getService(this, 0, stopIntent, PendingIntent.FLAG_IMMUTABLE)
 
         return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
             .setContentTitle("Camera Streaming")
             .setContentText(message)
-            .setSmallIcon(R.mipmap.ic_launcher) // Replace with your notification icon
+            .setSmallIcon(R.mipmap.ic_launcher)
             .setContentIntent(pendingIntent)
-            .addAction(
-                R.drawable.ic_launcher_foreground,
-                "Stop Stream",
-                stopPendingIntent
-            ) // Stop action
-            .setOngoing(true) // Make notification non-dismissible by swipe
+            .addAction(R.drawable.ic_launcher_foreground, "Stop Stream", stopPendingIntent)
+            .setOngoing(true)
             .build()
     }
 
-    override fun onBind(intent: Intent?): IBinder? {
-        return null // Services that are started only, not bound, return null
-    }
-
+    override fun onBind(intent: Intent?): IBinder? = null
 }
 
-
-private fun CameraDevice.closeSafely() {
-    try {
-        this.close()
-    } catch (e: Exception) {
-        Log.e(CameraStreamService.TAG, "Error closing camera device", e)
-    }
+private fun CameraDevice.safeClose() = runCatching { close() }.onFailure { 
+    Log.e(CameraStreamService.TAG, "Error closing camera device", it) 
 }
 
-private fun ImageReader.closeSafely() {
-    try {
-        this.close()
-    } catch (e: Exception) {
-        Log.e(CameraStreamService.TAG, "Error closing image reader", e)
-    }
+private fun ImageReader.safeClose() = runCatching { close() }.onFailure { 
+    Log.e(CameraStreamService.TAG, "Error closing image reader", it) 
 }
 
-private fun CameraCaptureSession.closeSafely() {
-    try {
-        this.close()
-    } catch (e: Exception) {
-        Log.e(CameraStreamService.TAG, "Error closing capture session", e)
-    }
+private fun CameraCaptureSession.safeClose() = runCatching { close() }.onFailure { 
+    Log.e(CameraStreamService.TAG, "Error closing capture session", it) 
 }
 
-fun ByteArrayOutputStream.closeSafely() {
-    try {
-        this.close()
-    } catch (e: IOException) {
-        Log.e(CameraStreamService.TAG, "Error closing ByteArrayOutputStream: ${e.message}")
-    }
+private fun AudioRecord.safeStopRelease() {
+    runCatching { stop() }
+    runCatching { release() }
 }
