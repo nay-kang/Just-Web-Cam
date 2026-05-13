@@ -10,6 +10,7 @@
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
@@ -40,7 +41,7 @@
         <service
             android:name=".CameraStreamService"
             android:exported="false"
-            android:foregroundServiceType="camera"
+            android:foregroundServiceType="camera|microphone"
             android:description="@string/foreground_service_justification" />
     </application>
 
