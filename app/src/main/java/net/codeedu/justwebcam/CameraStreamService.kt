@@ -108,9 +108,10 @@ class CameraStreamService : Service() {
             "net.codeedu.justwebcam.ACTION_START_STREAM" // Actions for starting/stopping
         const val ACTION_STOP_STREAM = "net.codeedu.justwebcam.ACTION_STOP_STREAM"
 
-        const val VIDEO_WIDTH = 1280
-        const val VIDEO_HEIGHT = 720
-        const val TARGET_FPS = 30
+        // Reference values from StreamConfig for backward compatibility
+        const val VIDEO_WIDTH = StreamConfig.VIDEO_WIDTH
+        const val VIDEO_HEIGHT = StreamConfig.VIDEO_HEIGHT
+        const val TARGET_FPS = StreamConfig.TARGET_FPS
 
         // Adaptive FPS ranges
         val FPS_RANGE = Range(5, TARGET_FPS)
@@ -118,7 +119,7 @@ class CameraStreamService : Service() {
         val previewSize = Size(VIDEO_WIDTH, VIDEO_HEIGHT)
 
         // Audio settings
-        const val AUDIO_SAMPLE_RATE = 32000
+        const val AUDIO_SAMPLE_RATE = StreamConfig.RTSP_SAMPLE_RATE
 
         const val ACTION_UPDATE_TIMESTAMP_STATE =
             "net.codeedu.justwebcam.ACTION_UPDATE_TIMESTAMP_STATE"
@@ -197,7 +198,7 @@ class CameraStreamService : Service() {
                 cameraHandler.post { updateStreamState() }
             },
             context = this,
-            8080
+            port = StreamConfig.MJPEG_PORT
         )
     }
 
@@ -208,7 +209,7 @@ class CameraStreamService : Service() {
                 rtspClientCount.set(count)
                 cameraHandler.post { updateStreamState() }
             },
-            1935
+            port = StreamConfig.RTSP_PORT
         )
         frameCallback = svc as FrameCallback
         audioCallback = svc as AudioCallback
@@ -433,7 +434,7 @@ class CameraStreamService : Service() {
 
         jpegOutputStream.reset()
         android.graphics.YuvImage(nv21, ImageFormat.NV21, width, height, null)
-            .compressToJpeg(android.graphics.Rect(0, 0, width, height), 50, jpegOutputStream)
+            .compressToJpeg(android.graphics.Rect(0, 0, width, height), StreamConfig.JPEG_QUALITY, jpegOutputStream)
         frameQueue.offer(jpegOutputStream.toByteArray())
     }
 

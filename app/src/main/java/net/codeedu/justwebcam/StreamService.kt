@@ -46,15 +46,15 @@ object StreamServiceFactory {
         frameQueue: java.util.concurrent.LinkedBlockingQueue<ByteArray>,
         clientCountCallback: (Int) -> Unit,
         context: Context,
-        port: Int = 8080
+        port: Int = StreamConfig.MJPEG_PORT
     ): StreamService {
         return MjpegStreamService(frameQueue, clientCountCallback, context, port)
     }
-    
+
     fun createRtspStreamService(
         context: Context,
         clientCountCallback: (Int) -> Unit,
-        port: Int = 1935
+        port: Int = StreamConfig.RTSP_PORT
     ): StreamService {
         return RtspStreamService(context, clientCountCallback, port)
     }

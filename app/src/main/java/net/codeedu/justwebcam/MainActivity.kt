@@ -20,6 +20,8 @@ import androidx.core.content.edit
 import java.net.Inet4Address
 import java.net.NetworkInterface
 
+import net.codeedu.justwebcam.StreamConfig
+
 class MainActivity : ComponentActivity() {
 
     private lateinit var multiplePermissionsResultLauncher: ActivityResultLauncher<Array<String>>
@@ -223,7 +225,9 @@ class MainActivity : ComponentActivity() {
         val ipAddress = getIPv4Address() ?: "N/A"
         ipAddressTextView.text = getString(
             R.string.stream_address_label,
-            ipAddress
+            ipAddress,
+            StreamConfig.MJPEG_PORT,
+            StreamConfig.RTSP_PORT
         )
     }
 

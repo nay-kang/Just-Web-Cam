@@ -15,7 +15,7 @@ import java.util.concurrent.atomic.AtomicInteger
 class RtspStreamService(
     private val context: Context,
     private val clientCountCallback: (Int) -> Unit,
-    private val port: Int = 1935
+    private val port: Int = StreamConfig.RTSP_PORT
 ) : StreamService, FrameCallback, AudioCallback, ConnectChecker, ClientListener {
 
     private var rtspServer: RtspServer? = null
@@ -36,7 +36,7 @@ class RtspStreamService(
 
     private var i420Buffer: ByteArray? = null
     // Pre-allocated frame pool to avoid GC pressure
-    private val framePool = Array(5) { ByteArray(CameraStreamService.VIDEO_WIDTH * CameraStreamService.VIDEO_HEIGHT * 3 / 2) }
+    private val framePool = Array(5) { ByteArray(StreamConfig.VIDEO_WIDTH * StreamConfig.VIDEO_HEIGHT * 3 / 2) }
     private var poolIndex = 0
 
     private val clientCounter = AtomicInteger(0)
@@ -45,9 +45,6 @@ class RtspStreamService(
     companion object {
         private const val TAG = "RtspStreamService"
         private const val VIDEO_MIME = "video/avc"
-        private const val VIDEO_BITRATE = 2_000_000
-        private const val SAMPLE_RATE = 32000
-        private const val I_FRAME_INTERVAL = 1
         private const val AUDIO_MIME = "audio/mp4a-latm"
     }
 
@@ -58,16 +55,17 @@ class RtspStreamService(
         }
 
         runCatching {
+            // Create RTSP server but don't start yet (wait for SPS/PPS)
             rtspServer = RtspServer(this, port).apply {
-                setAudioInfo(SAMPLE_RATE, false)
+                setAudioInfo(StreamConfig.RTSP_SAMPLE_RATE, false)
                 setClientListener(this@RtspStreamService)
             }
 
             // Video encoder setup
-            val videoFormat = MediaFormat.createVideoFormat(VIDEO_MIME, CameraStreamService.VIDEO_WIDTH, CameraStreamService.VIDEO_HEIGHT).apply {
-                setInteger(MediaFormat.KEY_BIT_RATE, VIDEO_BITRATE)
-                setInteger(MediaFormat.KEY_FRAME_RATE, CameraStreamService.TARGET_FPS)
-                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, I_FRAME_INTERVAL)
+            val videoFormat = MediaFormat.createVideoFormat(VIDEO_MIME, StreamConfig.VIDEO_WIDTH, StreamConfig.VIDEO_HEIGHT).apply {
+                setInteger(MediaFormat.KEY_BIT_RATE, StreamConfig.RTSP_VIDEO_BITRATE)
+                setInteger(MediaFormat.KEY_FRAME_RATE, StreamConfig.TARGET_FPS)
+                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, StreamConfig.RTSP_I_FRAME_INTERVAL)
                 setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Planar)
             }
 
@@ -77,8 +75,8 @@ class RtspStreamService(
             }
 
             // Audio encoder setup
-            val audioFormat = MediaFormat.createAudioFormat(AUDIO_MIME, SAMPLE_RATE, 1).apply {
-                setInteger(MediaFormat.KEY_BIT_RATE, 64000)
+            val audioFormat = MediaFormat.createAudioFormat(AUDIO_MIME, StreamConfig.RTSP_SAMPLE_RATE, 1).apply {
+                setInteger(MediaFormat.KEY_BIT_RATE, StreamConfig.RTSP_AUDIO_BITRATE)
                 setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
             }
 
@@ -92,10 +90,8 @@ class RtspStreamService(
             frameQueue = ArrayBlockingQueue(5)
 
             isRunning = true
-            serverStarted = true
-            rtspServer?.startServer()
             videoThread = Thread(::videoAudioLoop, "RtspVideoAudio").apply { start() }
-            Log.i(TAG, "RTSP server started on port $port")
+            Log.i(TAG, "RTSP server initialized on port $port (waiting for SPS/PPS before accepting connections)")
 
         }.onFailure { e ->
             Log.e(TAG, "Failed to start RTSP", e)
@@ -130,8 +126,8 @@ class RtspStreamService(
 
         codec.dequeueInputBuffer(5000).takeIf { it >= 0 }?.let { inIndex ->
             codec.getInputBuffer(inIndex)?.let { inBuf ->
-                val i420 = getI420Buffer(CameraStreamService.VIDEO_WIDTH, CameraStreamService.VIDEO_HEIGHT)
-                nv21ToI420(frame, i420, CameraStreamService.VIDEO_WIDTH, CameraStreamService.VIDEO_HEIGHT)
+                val i420 = getI420Buffer(StreamConfig.VIDEO_WIDTH, StreamConfig.VIDEO_HEIGHT)
+                nv21ToI420(frame, i420, StreamConfig.VIDEO_WIDTH, StreamConfig.VIDEO_HEIGHT)
                 inBuf.clear()
                 inBuf.put(i420)
                 codec.queueInputBuffer(inIndex, 0, i420.size, System.nanoTime() / 1000, 0)
@@ -201,6 +197,12 @@ class RtspStreamService(
                 }
                 if (!videoInfoSet) {
                     videoInfoSet = true
+                    // Now start the RTSP server after SPS/PPS is available
+                    if (!serverStarted) {
+                        serverStarted = true
+                        rtspServer?.startServer()
+                        Log.i(TAG, "RTSP server started on port $port (SPS/PPS ready)")
+                    }
                     Log.i(TAG, "RTSP video info set, server ready for connections")
                     clientCountCallback(clientCounter.get())
                 }

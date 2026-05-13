@@ -1,5 +1,7 @@
 <resources>
     <string name="app_name">Just Web Cam</string>
-    <string name="stream_address_label">HTTP: http://%1$s:8080/\nRTSP: rtsp://%1$s:1935/</string>
+    <string name="stream_address_label">HTTP: http://%1$s:%2$d/\nRTSP: rtsp://%1$s:%3$d/</string>
+    <string name="http_address_label">http://%1$s:%2$d/</string>
+    <string name="rtsp_address_label">rtsp://%1$s:%2$d/</string>
     <string name="foreground_service_justification">The camera stream service runs in the foreground to continuously stream video from the device camera to connected clients. This ensures the service remains active even when the app is in the background.</string>
 </resources>
