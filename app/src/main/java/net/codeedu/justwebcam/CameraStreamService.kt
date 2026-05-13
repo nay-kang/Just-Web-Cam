@@ -38,6 +38,7 @@ import android.util.Range
 import android.util.Size
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import androidx.core.graphics.createBitmap
 import java.io.ByteArrayOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -46,7 +47,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
-import androidx.core.graphics.createBitmap
+import java.util.concurrent.atomic.AtomicInteger
 
 class CameraStreamService : Service() {
     private lateinit var cameraId: String
@@ -57,8 +58,8 @@ class CameraStreamService : Service() {
     private var captureSession: CameraCaptureSession? = null
     private val cameraThread = HandlerThread("CameraThread").apply { start() }
     private val frameQueue = LinkedBlockingQueue<ByteArray>(1)
-    private lateinit var streamService: StreamService
-    private var currentProtocol = StreamProtocol.MJPEG
+    private lateinit var mjpegService: StreamService
+    private lateinit var rtspService: StreamService
     private val imageProcessingThread = HandlerThread("ImageProcessing").apply { start() }
     private val imageProcessingHandler = Handler(imageProcessingThread.looper)
     private lateinit var exposureLogger: ScheduledExecutorService
@@ -96,6 +97,9 @@ class CameraStreamService : Service() {
     // Cache SimpleDateFormat
     private val timestampFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
 
+    private val mjpegClientCount = AtomicInteger(0)
+    private val rtspClientCount = AtomicInteger(0)
+
     companion object {
         internal const val TAG = "CameraStreamService"
         private const val NOTIFICATION_CHANNEL_ID = "CameraStreamChannel"
@@ -118,8 +122,6 @@ class CameraStreamService : Service() {
         const val ACTION_UPDATE_TIMESTAMP_STATE =
             "net.codeedu.justwebcam.ACTION_UPDATE_TIMESTAMP_STATE"
         const val EXTRA_SHOW_TIMESTAMP = "net.codeedu.justwebcam.EXTRA_SHOW_TIMESTAMP"
-        const val ACTION_CHANGE_PROTOCOL = "net.codeedu.justwebcam.ACTION_CHANGE_PROTOCOL"
-        const val EXTRA_STREAM_PROTOCOL = "net.codeedu.justwebcam.EXTRA_STREAM_PROTOCOL"
     }
 
     override fun onCreate() {
@@ -128,15 +130,8 @@ class CameraStreamService : Service() {
         exposureLogger = Executors.newSingleThreadScheduledExecutor()
         captureCallback = createCaptureCallback()
         cameraManager = getSystemService(CAMERA_SERVICE) as CameraManager
-        // Initialize stream service based on saved protocol preference
-        val sharedPreferences = getSharedPreferences("main_activity_prefs", MODE_PRIVATE)
-        val savedProtocol = sharedPreferences.getString("stream_protocol", StreamProtocol.MJPEG.name)
-        currentProtocol = try {
-            StreamProtocol.valueOf(savedProtocol ?: StreamProtocol.MJPEG.name)
-        } catch (_: IllegalArgumentException) {
-            StreamProtocol.MJPEG
-        }
-        streamService = createStreamService(currentProtocol)
+        mjpegService = createMjpegService()
+        rtspService = createRtspService()
         Log.d(TAG, "Service onCreate")
     }
 
@@ -147,7 +142,8 @@ class CameraStreamService : Service() {
                 startForegroundService()
                 showTimestampOverlay = intent.getBooleanExtra(EXTRA_SHOW_TIMESTAMP, true)
                 startExposureLogging()
-                streamService.start()
+                mjpegService.start()
+                rtspService.start()
             }
             ACTION_STOP_STREAM -> {
                 stopCameraStreaming()
@@ -157,16 +153,6 @@ class CameraStreamService : Service() {
             ACTION_UPDATE_TIMESTAMP_STATE -> {
                 showTimestampOverlay = intent.getBooleanExtra(EXTRA_SHOW_TIMESTAMP, true)
                 Log.d(TAG, "Timestamp overlay state updated to: $showTimestampOverlay")
-            }
-            ACTION_CHANGE_PROTOCOL -> {
-                val protocolName = intent.getStringExtra(EXTRA_STREAM_PROTOCOL)
-                val newProtocol = try {
-                    StreamProtocol.valueOf(protocolName ?: StreamProtocol.MJPEG.name)
-                } catch (_: IllegalArgumentException) {
-                    Log.w(TAG, "Unknown protocol: $protocolName, using MJPEG")
-                    StreamProtocol.MJPEG
-                }
-                changeStreamProtocol(newProtocol)
             }
             else -> Log.w(TAG, "Unknown action: ${intent?.action}")
         }
@@ -180,11 +166,7 @@ class CameraStreamService : Service() {
         Log.d(TAG, "Foreground service started")
 
         getBatteryPercentageCached() // pre-warm battery cache before camera produces frames
-
-        if (currentProtocol == StreamProtocol.RTSP) {
-            startAudio()
-            startCamera()
-        }
+        startCamera()
     }
 
     private fun stopForegroundService() {
@@ -192,74 +174,48 @@ class CameraStreamService : Service() {
         Log.d(TAG, "Foreground service stopped")
     }
 
-    private fun onClientCountChanged(clientCount: Int) {
-        Log.d(TAG, "Client count changed: $clientCount for protocol $currentProtocol")
-        cameraHandler.post {
-            if (clientCount > 0) {
-                if (currentProtocol == StreamProtocol.RTSP) {
-                    startAudio()
-                }
-                startCamera()
-            } else {
-                stopCamera()
-                if (currentProtocol == StreamProtocol.RTSP) {
-                    stopAudio()
-                }
-            }
-        }
-    }
-
-    private fun createStreamService(protocol: StreamProtocol): StreamService {
-        return when (protocol) {
-            StreamProtocol.MJPEG -> {
-                frameCallback = null
-                audioCallback = null
-                StreamServiceFactory.createMjpegStreamService(
-                    frameQueue = frameQueue,
-                    clientCountCallback = ::onClientCountChanged,
-                    context = this,
-                    8080
-                )
-            }
-            StreamProtocol.RTSP -> {
-                val svc = StreamServiceFactory.createRtspStreamService(this, ::onClientCountChanged, 1935)
-                frameCallback = svc as FrameCallback
-                audioCallback = svc as AudioCallback
-                svc
-            }
-        }
-    }
-
-    private fun changeStreamProtocol(newProtocol: StreamProtocol) {
-        if (currentProtocol == newProtocol) {
-            Log.d(TAG, "Protocol already set to $newProtocol")
-            return
-        }
-
-        Log.i(TAG, "Changing stream protocol from $currentProtocol to $newProtocol")
-        
-        if (streamService.isRunning()) {
-            streamService.stop()
-        }
-        
-        // Stop camera/audio before switching protocol
-        stopCamera()
-        stopAudio()
-        
-        streamService = createStreamService(newProtocol)
-        currentProtocol = newProtocol
-        streamService.start()
-
-        if (newProtocol == StreamProtocol.RTSP) {
-            startAudio()
+    private fun updateStreamState() {
+        val total = mjpegClientCount.get() + rtspClientCount.get()
+        Log.d(TAG, "Total clients: $total (MJPEG: ${mjpegClientCount.get()}, RTSP: ${rtspClientCount.get()})")
+        if (total > 0) {
             startCamera()
+            startAudio()
+        } else {
+            stopCamera()
+            stopAudio()
         }
-        
-        Log.i(TAG, "Stream protocol changed to $newProtocol. URL: ${streamService.getStreamUrl()}")
+    }
+
+    private fun createMjpegService(): StreamService {
+        frameCallback = null
+        audioCallback = null
+        return StreamServiceFactory.createMjpegStreamService(
+            frameQueue = frameQueue,
+            clientCountCallback = { count ->
+                mjpegClientCount.set(count)
+                cameraHandler.post { updateStreamState() }
+            },
+            context = this,
+            8080
+        )
+    }
+
+    private fun createRtspService(): StreamService {
+        val svc = StreamServiceFactory.createRtspStreamService(
+            this,
+            { count ->
+                rtspClientCount.set(count)
+                cameraHandler.post { updateStreamState() }
+            },
+            1935
+        )
+        frameCallback = svc as FrameCallback
+        audioCallback = svc as AudioCallback
+        return svc
     }
 
     private fun startAudio() {
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) 
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
             != PackageManager.PERMISSION_GRANTED
         ) {
             Log.w(TAG, "RECORD_AUDIO permission not granted, audio will be disabled")
@@ -271,7 +227,7 @@ class CameraStreamService : Service() {
                 AUDIO_SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT
             ).coerceAtLeast(2048)
-            
+
             audioRecord = AudioRecord(
                 MediaRecorder.AudioSource.MIC,
                 AUDIO_SAMPLE_RATE,
@@ -279,11 +235,11 @@ class CameraStreamService : Service() {
                 AudioFormat.ENCODING_PCM_16BIT,
                 minBuf
             ).apply { startRecording() }
-            
+
             isAudioRunning = true
             audioThread = Thread(::audioLoop, "CameraAudio").apply { start() }
             Log.i(TAG, "Audio capture started")
-            
+
         }.onFailure { e ->
             Log.e(TAG, "Failed to start audio", e)
             stopAudio()
@@ -327,7 +283,8 @@ class CameraStreamService : Service() {
 
     private fun stopCameraStreaming() {
         stopExposureLogging()
-        streamService.stop()
+        mjpegService.stop()
+        rtspService.stop()
         stopAudio()
         stopCamera()
         Log.d(TAG, "Camera streaming stopped")
@@ -336,7 +293,7 @@ class CameraStreamService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         stopCameraStreaming()
-        
+
         cameraThread.quitSafely()
         runCatching { cameraThread.join() }.onFailure { e ->
             Log.e(TAG, "Interrupted while waiting for camera thread", e)
@@ -373,7 +330,7 @@ class CameraStreamService : Service() {
             Log.d(TAG, "Camera already started")
             return
         }
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) 
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
             == PackageManager.PERMISSION_GRANTED
         ) {
             setupCamera()
@@ -441,7 +398,7 @@ class CameraStreamService : Service() {
         style = Paint.Style.FILL
         textAlign = Paint.Align.LEFT
     }
-    
+
     private val borderPaint = Paint().apply {
         color = Color.BLACK
         textSize = 40f
@@ -473,12 +430,10 @@ class CameraStreamService : Service() {
 
         frameCallback?.onNv21Frame(nv21, width, height, System.nanoTime() / 1000)
 
-        if (currentProtocol == StreamProtocol.MJPEG) {
-            jpegOutputStream.reset()
-            android.graphics.YuvImage(nv21, ImageFormat.NV21, width, height, null)
-                .compressToJpeg(android.graphics.Rect(0, 0, width, height), 50, jpegOutputStream)
-            frameQueue.offer(jpegOutputStream.toByteArray())
-        }
+        jpegOutputStream.reset()
+        android.graphics.YuvImage(nv21, ImageFormat.NV21, width, height, null)
+            .compressToJpeg(android.graphics.Rect(0, 0, width, height), 50, jpegOutputStream)
+        frameQueue.offer(jpegOutputStream.toByteArray())
     }
 
     private fun getNv21Buffer(width: Int, height: Int): ByteArray {
@@ -564,12 +519,12 @@ class CameraStreamService : Service() {
 
     private fun logCurrentExposureSettings() {
         Log.d(TAG, "Last captured exposure - Time: ${lastLoggedExposureTime ?: "N/A"} ns, ISO: ${lastLoggedIso ?: "N/A"}")
-        
+
         runCatching {
             val cameraCharacteristics = cameraManager.getCameraCharacteristics(cameraId)
             val exposureTimeRange = cameraCharacteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
             val isoRange = cameraCharacteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
-            
+
             Log.d(TAG, "Available Ranges - Exposure: ${exposureTimeRange?.lower}-${exposureTimeRange?.upper} ns, ISO: ${isoRange?.lower}-${isoRange?.upper}")
         }.onFailure { e ->
             Log.e(TAG, "Failed to get camera characteristics", e)
@@ -578,23 +533,23 @@ class CameraStreamService : Service() {
 
     private fun createCaptureCallback(): CameraCaptureSession.CaptureCallback {
         return object : CameraCaptureSession.CaptureCallback() {
-            override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, 
+            override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest,
                 result: android.hardware.camera2.TotalCaptureResult) {
                 super.onCaptureCompleted(session, request, result)
-                
+
                 val exposureTime = result.get(CaptureResult.SENSOR_EXPOSURE_TIME)
                 val iso = result.get(CaptureResult.SENSOR_SENSITIVITY)
-                
+
                 lastLoggedExposureTime = exposureTime
                 lastLoggedIso = iso
-                
+
                 val currentTime = System.currentTimeMillis()
                 val shouldLog = currentTime - lastLogTime > 10000
-                val exposureChanged = lastLoggedExposureTime != null && exposureTime != null && 
+                val exposureChanged = lastLoggedExposureTime != null && exposureTime != null &&
                     kotlin.math.abs(exposureTime - lastLoggedExposureTime!!) > EXPOSURE_CHANGE_THRESHOLD_NS
-                val isoChanged = lastLoggedIso != null && iso != null && 
+                val isoChanged = lastLoggedIso != null && iso != null &&
                     kotlin.math.abs(iso - lastLoggedIso!!) > ISO_CHANGE_THRESHOLD
-                
+
                 if (shouldLog || exposureChanged || isoChanged) {
                     Log.d(TAG, "AE Mode: ${result.get(CaptureResult.CONTROL_AE_MODE)}, " +
                         "Exposure: ${exposureTime}ns (${exposureTime?.div(1_000_000)}ms), ISO: $iso")
@@ -678,7 +633,7 @@ class CameraStreamService : Service() {
                         set(CaptureRequest.CONTROL_SCENE_MODE, CaptureRequest.CONTROL_SCENE_MODE_NIGHT)
                         set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_FAST)
                         set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON)
-                        
+
                         cameraManager.getCameraCharacteristics(cameraId)
                             .get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)?.let { range ->
                                 if (range.upper >= 1) {
@@ -725,16 +680,16 @@ class CameraStreamService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 }
 
-private fun CameraDevice.safeClose() = runCatching { close() }.onFailure { 
-    Log.e(CameraStreamService.TAG, "Error closing camera device", it) 
+private fun CameraDevice.safeClose() = runCatching { close() }.onFailure {
+    Log.e(CameraStreamService.TAG, "Error closing camera device", it)
 }
 
-private fun ImageReader.safeClose() = runCatching { close() }.onFailure { 
-    Log.e(CameraStreamService.TAG, "Error closing image reader", it) 
+private fun ImageReader.safeClose() = runCatching { close() }.onFailure {
+    Log.e(CameraStreamService.TAG, "Error closing image reader", it)
 }
 
-private fun CameraCaptureSession.safeClose() = runCatching { close() }.onFailure { 
-    Log.e(CameraStreamService.TAG, "Error closing capture session", it) 
+private fun CameraCaptureSession.safeClose() = runCatching { close() }.onFailure {
+    Log.e(CameraStreamService.TAG, "Error closing capture session", it)
 }
 
 private fun AudioRecord.safeStopRelease() {
