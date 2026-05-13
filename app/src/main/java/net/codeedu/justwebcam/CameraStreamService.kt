@@ -76,6 +76,7 @@ class CameraStreamService : Service() {
     private var nv21Buffer: ByteArray? = null
     private var timestampBitmap: Bitmap? = null
     private var timestampCanvas: Canvas? = null
+    private var timestampPixels: IntArray? = null  // Cache for bitmap pixels
     private var lastTimestampString: String? = null
     private var cachedBattery = 0
     private var lastBatteryUpdate = 0L
@@ -487,26 +488,31 @@ class CameraStreamService : Service() {
             if (timestampBitmap == null) {
                 timestampBitmap = createBitmap(550, 60)
                 timestampCanvas = Canvas(timestampBitmap!!)
+                timestampPixels = IntArray(550 * 60)
             }
             timestampBitmap!!.eraseColor(Color.TRANSPARENT)
             timestampCanvas!!.drawText(label, 10f, 45f, borderPaint)
             timestampCanvas!!.drawText(label, 10f, 45f, textPaint)
+
+            // Only update pixels when text changes
+            timestampBitmap!!.getPixels(timestampPixels!!, 0, timestampBitmap!!.width, 0, 0, timestampBitmap!!.width, timestampBitmap!!.height)
         }
 
-        val overlay = timestampBitmap!!
-        val pixels = IntArray(overlay.width * overlay.height)
-        overlay.getPixels(pixels, 0, overlay.width, 0, 0, overlay.width, overlay.height)
+        val pixels = timestampPixels!!
+        val overlayWidth = timestampBitmap!!.width
+        val overlayHeight = timestampBitmap!!.height
 
-        for (i in 0 until overlay.height) {
-            for (j in 0 until overlay.width) {
-                val p = pixels[i * overlay.width + j]
+        for (i in 0 until overlayHeight) {
+            for (j in 0 until overlayWidth) {
+                val p = pixels[i * overlayWidth + j]
                 if ((p ushr 24) > 128) {
                     val yIdx = (20 + i) * width + (20 + j)
                     if (yIdx < width * height) {
                         val r = (p shr 16) and 0xFF
                         val g = (p shr 8) and 0xFF
                         val b = p and 0xFF
-                        nv21[yIdx] = (0.299 * r + 0.587 * g + 0.114 * b).toInt().toByte()
+                        // Integer arithmetic: Y = (77*R + 150*G + 29*B) / 256
+                        nv21[yIdx] = ((77 * r + 150 * g + 29 * b) shr 8).toByte()
                     }
                 }
             }

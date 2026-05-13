@@ -9,6 +9,7 @@ import com.pedro.common.ConnectChecker
 import com.pedro.rtspserver.server.ClientListener
 import com.pedro.rtspserver.server.RtspServer
 import com.pedro.rtspserver.server.ServerClient
+import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.atomic.AtomicInteger
 
 class RtspStreamService(
@@ -24,18 +25,18 @@ class RtspStreamService(
     private var serverStarted = false
     private var videoThread: Thread? = null
 
-    @Volatile
-    private var pendingFrame: ByteArray? = null
+    // Frame queue for thread-safe passing from camera callback to encoder (capacity=5)
+    private var frameQueue: ArrayBlockingQueue<ByteArray>? = null
     @Volatile
     private var pendingAudio: ShortArray? = null
     @Volatile
     private var pendingAudioLength = 0
     @Volatile
     private var pendingAudioTimestampUs = 0L
-    
+
     private var i420Buffer: ByteArray? = null
-    // Double-buffer for thread-safe frame passing from camera callback to encoder
-    private val framePool = Array(2) { ByteArray(CameraStreamService.VIDEO_WIDTH * CameraStreamService.VIDEO_HEIGHT * 3 / 2) }
+    // Pre-allocated frame pool to avoid GC pressure
+    private val framePool = Array(5) { ByteArray(CameraStreamService.VIDEO_WIDTH * CameraStreamService.VIDEO_HEIGHT * 3 / 2) }
     private var poolIndex = 0
 
     private val clientCounter = AtomicInteger(0)
@@ -87,6 +88,9 @@ class RtspStreamService(
             }
             Log.i(TAG, "RTSP audio encoder started")
 
+            // Initialize frame queue with capacity 5
+            frameQueue = ArrayBlockingQueue(5)
+
             isRunning = true
             serverStarted = true
             rtspServer?.startServer()
@@ -122,16 +126,15 @@ class RtspStreamService(
     }
 
     private fun processVideoFrame(codec: MediaCodec) {
-        pendingFrame?.let { frame ->
-            pendingFrame = null
-            codec.dequeueInputBuffer(5000).takeIf { it >= 0 }?.let { inIndex ->
-                codec.getInputBuffer(inIndex)?.let { inBuf ->
-                    val i420 = getI420Buffer(CameraStreamService.VIDEO_WIDTH, CameraStreamService.VIDEO_HEIGHT)
-                    nv21ToI420(frame, i420, CameraStreamService.VIDEO_WIDTH, CameraStreamService.VIDEO_HEIGHT)
-                    inBuf.clear()
-                    inBuf.put(i420)
-                    codec.queueInputBuffer(inIndex, 0, i420.size, System.nanoTime() / 1000, 0)
-                }
+        val frame = frameQueue?.poll() ?: return
+
+        codec.dequeueInputBuffer(5000).takeIf { it >= 0 }?.let { inIndex ->
+            codec.getInputBuffer(inIndex)?.let { inBuf ->
+                val i420 = getI420Buffer(CameraStreamService.VIDEO_WIDTH, CameraStreamService.VIDEO_HEIGHT)
+                nv21ToI420(frame, i420, CameraStreamService.VIDEO_WIDTH, CameraStreamService.VIDEO_HEIGHT)
+                inBuf.clear()
+                inBuf.put(i420)
+                codec.queueInputBuffer(inIndex, 0, i420.size, System.nanoTime() / 1000, 0)
             }
         }
     }
@@ -235,7 +238,8 @@ class RtspStreamService(
         videoCodec = null
         audioCodec = null
         i420Buffer = null
-        pendingFrame = null
+        frameQueue?.clear()
+        frameQueue = null
         pendingAudio = null
         videoThread = null
     }
@@ -253,10 +257,18 @@ class RtspStreamService(
 
     override fun onNv21Frame(nv21: ByteArray, width: Int, height: Int, timestampUs: Long) {
         if (!isRunning) return
+        val queue = frameQueue ?: return
+
+        // Get a buffer from pool (circular)
         val copy = framePool[poolIndex]
         poolIndex = (poolIndex + 1) % framePool.size
         System.arraycopy(nv21, 0, copy, 0, nv21.size)
-        pendingFrame = copy
+
+        // Offer to queue, drop oldest if full
+        if (!queue.offer(copy)) {
+            queue.poll()  // Remove oldest frame
+            queue.offer(copy)  // Retry
+        }
     }
 
     override fun onAudioData(buffer: ShortArray, length: Int, timestampUs: Long) {
