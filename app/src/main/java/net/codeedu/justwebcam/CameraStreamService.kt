@@ -48,6 +48,7 @@ import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.math.abs
 
 class CameraStreamService : Service() {
     private lateinit var cameraId: String
@@ -62,13 +63,23 @@ class CameraStreamService : Service() {
     private lateinit var rtspService: StreamService
     private val imageProcessingThread = HandlerThread("ImageProcessing").apply { start() }
     private val imageProcessingHandler = Handler(imageProcessingThread.looper)
-    private lateinit var exposureLogger: ScheduledExecutorService
+    private var exposureLogger: ScheduledExecutorService? = null
     private var captureCallback: CameraCaptureSession.CaptureCallback? = null
     private var lastLoggedExposureTime: Long? = null
     private var lastLoggedIso: Int? = null
     private var lastLogTime: Long = 0
     private val EXPOSURE_CHANGE_THRESHOLD_NS = 10_000_000L // 10ms threshold for logging changes
     private val ISO_CHANGE_THRESHOLD = 50 // ISO threshold for logging changes
+
+    // Manual exposure state for extremely dark scenes
+    private var isManualExposure = false
+    private var averageFrameY = 128f
+    private var luminanceFrameCounter = 0
+    private var switchBackFrameCount = 0
+    private var switchToManualFrameCount = 0
+    private var manualAdjustmentCounter = 0
+    private var maxIso: Int = 1600
+    private var currentManualIso: Int = 1600
 
     private var showTimestampOverlay = true
 
@@ -118,6 +129,14 @@ class CameraStreamService : Service() {
 
         val previewSize = Size(VIDEO_WIDTH, VIDEO_HEIGHT)
 
+        // Manual exposure: switch to fixed long exposure when auto can't cope
+        private const val DARKNESS_Y_THRESHOLD = 20f
+        private const val BRIGHT_ENOUGH_Y_THRESHOLD = 120f
+        private const val MANUAL_EXPOSURE_TIME_NS = 140_000_000L   // 140ms exposure
+        private const val MANUAL_FRAME_DURATION_NS = 150_000_000L  // 150ms → 6 FPS
+        private const val SWITCH_BACK_CONSECUTIVE_FRAMES = 15
+        private const val SWITCH_TO_MANUAL_CONSECUTIVE_FRAMES = 35 // ~1s at 30fps
+
         // Audio settings
         const val AUDIO_SAMPLE_RATE = StreamConfig.RTSP_SAMPLE_RATE
 
@@ -129,7 +148,6 @@ class CameraStreamService : Service() {
     override fun onCreate() {
         super.onCreate()
         cameraHandler = Handler(cameraThread.looper)
-        exposureLogger = Executors.newSingleThreadScheduledExecutor()
         captureCallback = createCaptureCallback()
         cameraManager = getSystemService(CAMERA_SERVICE) as CameraManager
         mjpegService = createMjpegService()
@@ -143,7 +161,6 @@ class CameraStreamService : Service() {
             ACTION_START_STREAM -> {
                 startForegroundService()
                 showTimestampOverlay = intent.getBooleanExtra(EXTRA_SHOW_TIMESTAMP, true)
-                startExposureLogging()
                 mjpegService.start()
                 rtspService.start()
             }
@@ -217,6 +234,7 @@ class CameraStreamService : Service() {
     }
 
     private fun startAudio() {
+        if (isAudioRunning) return
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
             != PackageManager.PERMISSION_GRANTED
         ) {
@@ -284,7 +302,6 @@ class CameraStreamService : Service() {
     }
 
     private fun stopCameraStreaming() {
-        stopExposureLogging()
         mjpegService.stop()
         rtspService.stop()
         stopAudio()
@@ -336,12 +353,14 @@ class CameraStreamService : Service() {
             == PackageManager.PERMISSION_GRANTED
         ) {
             setupCamera()
+            startExposureLogging()
         } else {
             Log.w(TAG, "Camera permission not granted")
         }
     }
 
     private fun stopCamera() {
+        stopExposureLogging()
         captureSession?.safeClose()
         captureSession = null
         cameraDevice?.safeClose()
@@ -356,6 +375,10 @@ class CameraStreamService : Service() {
                 cameraManager.getCameraCharacteristics(id)
                     .get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
             } ?: throw IllegalStateException("Back camera not found")
+
+            maxIso = cameraManager.getCameraCharacteristics(cameraId)
+                .get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)?.upper ?: 1600
+            Log.d(TAG, "Camera $cameraId max ISO: $maxIso")
 
             imageReader = ImageReader.newInstance(
                 previewSize.width, previewSize.height,
@@ -419,10 +442,40 @@ class CameraStreamService : Service() {
         return cachedBattery
     }
 
+    /**
+     * Compute average Y-plane brightness by sampling a grid pattern.
+     * Returns 0 (black) to 255 (white). Efficient O(width*height/step²) with step=32.
+     */
+    private fun computeAverageY(nv21: ByteArray, width: Int, height: Int): Float {
+        val stepX = 32
+        val stepY = 32
+        var sum = 0L
+        var count = 0
+        var y = 0
+        while (y < height) {
+            val rowOffset = y * width
+            var x = 0
+            while (x < width) {
+                sum += nv21[rowOffset + x].toInt() and 0xFF
+                count++
+                x += stepX
+            }
+            y += stepY
+        }
+        return if (count > 0) sum.toFloat() / count else 128f
+    }
+
     private fun processAndQueueFrame(image: Image) {
         val width = image.width
         val height = image.height
         val nv21 = imageToNv21(image)
+
+        // Only compute average luminance every 5 frames to save CPU
+        luminanceFrameCounter++
+        if (luminanceFrameCounter >= 5) {
+            luminanceFrameCounter = 0
+            averageFrameY = computeAverageY(nv21, width, height)
+        }
 
         if (showTimestampOverlay) {
             val timestamp = timestampFormat.format(Date())
@@ -521,7 +574,10 @@ class CameraStreamService : Service() {
     }
 
     private fun startExposureLogging() {
-        exposureLogger.scheduleWithFixedDelay({ logCurrentExposureSettings() }, 0, 10, TimeUnit.SECONDS)
+        if (exposureLogger != null) return
+        exposureLogger = Executors.newSingleThreadScheduledExecutor().apply {
+            scheduleWithFixedDelay({ logCurrentExposureSettings() }, 0, 10, TimeUnit.SECONDS)
+        }
     }
 
     private fun logCurrentExposureSettings() {
@@ -553,21 +609,118 @@ class CameraStreamService : Service() {
                 val currentTime = System.currentTimeMillis()
                 val shouldLog = currentTime - lastLogTime > 10000
                 val exposureChanged = lastLoggedExposureTime != null && exposureTime != null &&
-                    kotlin.math.abs(exposureTime - lastLoggedExposureTime!!) > EXPOSURE_CHANGE_THRESHOLD_NS
+                    abs(exposureTime - lastLoggedExposureTime!!) > EXPOSURE_CHANGE_THRESHOLD_NS
                 val isoChanged = lastLoggedIso != null && iso != null &&
-                    kotlin.math.abs(iso - lastLoggedIso!!) > ISO_CHANGE_THRESHOLD
+                    abs(iso - lastLoggedIso!!) > ISO_CHANGE_THRESHOLD
 
                 if (shouldLog || exposureChanged || isoChanged) {
                     Log.d(TAG, "AE Mode: ${result.get(CaptureResult.CONTROL_AE_MODE)}, " +
-                        "Exposure: ${exposureTime}ns (${exposureTime?.div(1_000_000)}ms), ISO: $iso")
+                        "Exposure: ${exposureTime}ns (${exposureTime?.div(1_000_000)}ms), ISO: $iso, Yavg: ${averageFrameY.toInt()}")
                     lastLogTime = currentTime
                 }
+
+                updateExposureMode(session, iso)
             }
         }
     }
 
+    private fun updateExposureMode(session: CameraCaptureSession, actualIso: Int?) {
+        if (isManualExposure) {
+            // 1. Adaptive Manual Exposure: adjust ISO to maintain target brightness
+            // Throttle adjustments to once every 10 frames to prevent oscillation
+            if (++manualAdjustmentCounter >= 10) {
+                manualAdjustmentCounter = 0
+                val targetY = 60f
+                val currentIso = actualIso ?: currentManualIso
+                
+                if (abs(averageFrameY - targetY) > 12f) {
+                    val nextIso = (currentIso * (targetY / averageFrameY.coerceAtLeast(1f)))
+                        .toInt().coerceIn(100, maxIso)
+                    
+                    if (abs(nextIso - currentManualIso) > 50) {
+                        currentManualIso = nextIso
+                        applyManualExposure(session)
+                    }
+                }
+            }
+
+            // 2. Manual → Auto check
+            if (averageFrameY > BRIGHT_ENOUGH_Y_THRESHOLD) {
+                if (++switchBackFrameCount >= SWITCH_BACK_CONSECUTIVE_FRAMES) {
+                    Log.i(TAG, "Bright enough → switching back to auto")
+                    isManualExposure = false
+                    switchBackFrameCount = 0
+                    runCatching {
+                        session.setRepeatingRequest(buildAutoExposureRequest(session), captureCallback, cameraHandler)
+                    }.onFailure { e ->
+                        Log.e(TAG, "Failed to set auto exposure", e)
+                        isManualExposure = true
+                    }
+                }
+            } else {
+                switchBackFrameCount = 0
+            }
+        } else {
+            // Auto mode: switch to manual only if scene is sustained dark (AE failed)
+            if (averageFrameY < DARKNESS_Y_THRESHOLD) {
+                if (++switchToManualFrameCount >= SWITCH_TO_MANUAL_CONSECUTIVE_FRAMES) {
+                    Log.i(TAG, "Sustained darkness → manual start (ISO: $actualIso)")
+                    isManualExposure = true
+                    currentManualIso = maxIso
+                    switchToManualFrameCount = 0
+                    switchBackFrameCount = 0
+                    applyManualExposure(session)
+                }
+            } else {
+                switchToManualFrameCount = 0
+            }
+        }
+    }
+
+    private fun applyManualExposure(session: CameraCaptureSession) {
+        runCatching {
+            val request = session.device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                addTarget(imageReader!!.surface)
+                // Reset to AUTO to clear any SCENE_MODE (Night mode) which conflicts with manual control
+                set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
+                set(CaptureRequest.SENSOR_EXPOSURE_TIME, MANUAL_EXPOSURE_TIME_NS)
+                set(CaptureRequest.SENSOR_SENSITIVITY, currentManualIso)
+                set(CaptureRequest.SENSOR_FRAME_DURATION, MANUAL_FRAME_DURATION_NS)
+                applyCommonSettings()
+            }.build()
+            session.setRepeatingRequest(request, captureCallback, cameraHandler)
+        }.onFailure { e ->
+            Log.e(TAG, "Failed to set manual exposure", e)
+        }
+    }
+
+    private fun buildAutoExposureRequest(session: CameraCaptureSession): CaptureRequest {
+        return session.device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+            addTarget(imageReader!!.surface)
+            set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, FPS_RANGE)
+
+            val aeModes = cameraManager.getCameraCharacteristics(cameraId)
+                .get(CameraCharacteristics.CONTROL_AE_AVAILABLE_MODES) ?: intArrayOf()
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM &&
+                aeModes.contains(CameraMetadata.CONTROL_AE_MODE_ON_LOW_LIGHT_BOOST_BRIGHTNESS_PRIORITY)) {
+                set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON_LOW_LIGHT_BOOST_BRIGHTNESS_PRIORITY)
+            }
+
+            applyCommonSettings()
+
+            cameraManager.getCameraCharacteristics(cameraId)
+                .get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)?.let { range ->
+                    if (range.upper >= 1) {
+                        set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, minOf(1, range.upper))
+                    }
+                }
+        }.build()
+    }
+
     private fun stopExposureLogging() {
-        exposureLogger.shutdown()
+        exposureLogger?.shutdown()
+        exposureLogger = null
     }
 
     private val cameraStateCallback = object : CameraDevice.StateCallback() {
@@ -627,28 +780,10 @@ class CameraStreamService : Service() {
 
     private fun startCaptureSession() {
         captureSession?.let { session ->
-            imageReader?.surface?.let { surface ->
+            imageReader?.surface?.let {
                 runCatching {
-                    val requestBuilder = session.device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
-                        addTarget(surface)
-                        set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, FPS_RANGE)
-
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
-                            set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON_LOW_LIGHT_BOOST_BRIGHTNESS_PRIORITY)
-                        }
-                        set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_USE_SCENE_MODE)
-                        set(CaptureRequest.CONTROL_SCENE_MODE, CaptureRequest.CONTROL_SCENE_MODE_NIGHT)
-                        set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_FAST)
-                        set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON)
-
-                        cameraManager.getCameraCharacteristics(cameraId)
-                            .get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)?.let { range ->
-                                if (range.upper >= 1) {
-                                    set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, minOf(1, range.upper))
-                                }
-                            }
-                    }
-                    session.setRepeatingRequest(requestBuilder.build(), captureCallback, cameraHandler)
+                    val request = buildAutoExposureRequest(session)
+                    session.setRepeatingRequest(request, captureCallback, cameraHandler)
                 }.onFailure { e ->
                     Log.e(TAG, "Repeating capture request exception", e)
                 }
@@ -702,4 +837,13 @@ private fun CameraCaptureSession.safeClose() = runCatching { close() }.onFailure
 private fun AudioRecord.safeStopRelease() {
     runCatching { stop() }
     runCatching { release() }
+}
+
+private fun CaptureRequest.Builder.applyCommonSettings() {
+    set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_FAST)
+    set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON)
+    set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+// the night mode seems do not have any effects
+//    set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_USE_SCENE_MODE)
+//    set(CaptureRequest.CONTROL_SCENE_MODE, CaptureRequest.CONTROL_SCENE_MODE_NIGHT)
 }
